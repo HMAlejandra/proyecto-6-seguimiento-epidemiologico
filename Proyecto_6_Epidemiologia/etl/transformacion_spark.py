@@ -714,9 +714,19 @@ def calcular_promedio_casos_por_pais(df_epidemiologia: DataFrame) -> DataFrame:
     # Filtrar a nivel país para evitar doble conteo
     df_pais = filtrar_nivel_geografico(df_epidemiologia, nivel="pais")
 
+    # Excluir nulos, negativos y filas sin país identificado.
+    # Los negativos son correcciones contables, no contagios reales; incluirlos
+    # distorsionaría promedios y sumas de forma inconsistente con el ANOVA,
+    # que ya los excluye en preparar_datos_anova().
+    # Los nulos en country_name provienen de location_keys sin coincidencia en
+    # index.csv (left join); se excluyen para no crear un grupo espurio "null".
     agg = (
         df_pais
-        .filter(F.col("new_confirmed").isNotNull())
+        .filter(
+            F.col("new_confirmed").isNotNull() &
+            (F.col("new_confirmed") >= 0) &
+            F.col("country_name").isNotNull()
+        )
         .groupBy("country_name")
         .agg(
             F.avg("new_confirmed").alias("avg_new_confirmed"),
@@ -792,9 +802,19 @@ def calcular_evolucion_temporal(df_epidemiologia: DataFrame) -> DataFrame:
     if "cumulative_confirmed" in df_pais.columns:
         agg_cols.append(F.max("cumulative_confirmed").alias("max_cumulative_confirmed"))
 
+    # Excluir negativos para que la evolución temporal sea coherente con el
+    # filtrado aplicado en el ANOVA (preparar_datos_anova excluye new_confirmed < 0).
+    # Los valores negativos corresponden a correcciones contables; incluirlos
+    # reduciría artificialmente los totales diarios globales.
+    filtros = F.col("date").isNotNull()
+    if "new_confirmed" in df_pais.columns:
+        filtros = filtros & ((F.col("new_confirmed").isNull()) | (F.col("new_confirmed") >= 0))
+    if "new_deceased" in df_pais.columns:
+        filtros = filtros & ((F.col("new_deceased").isNull()) | (F.col("new_deceased") >= 0))
+
     agg = (
         df_pais
-        .filter(F.col("date").isNotNull())
+        .filter(filtros)
         .groupBy("date")
         .agg(*agg_cols)
         .orderBy("date")
@@ -927,9 +947,23 @@ def calcular_relacion_casos_fallecimientos(df_epidemiologia: DataFrame) -> DataF
         logger.warning("Falta country_name. No se puede calcular relación por país.")
         return df_pais
 
+    # Excluir negativos en ambas columnas para que la tasa de letalidad
+    # no se distorsione por correcciones contables.
+    # Se permite que new_deceased sea nulo (no todos los países reportan
+    # fallecimientos diarios), pero no negativo.
+    filtros_letal = F.col("country_name").isNotNull()
+    if "new_confirmed" in df_pais.columns:
+        filtros_letal = filtros_letal & (
+            F.col("new_confirmed").isNull() | (F.col("new_confirmed") >= 0)
+        )
+    if "new_deceased" in df_pais.columns:
+        filtros_letal = filtros_letal & (
+            F.col("new_deceased").isNull() | (F.col("new_deceased") >= 0)
+        )
+
     df_agg = (
         df_pais
-        .filter(F.col("country_name").isNotNull())
+        .filter(filtros_letal)
         .groupBy("country_name")
         .agg(*agg_cols)
     )

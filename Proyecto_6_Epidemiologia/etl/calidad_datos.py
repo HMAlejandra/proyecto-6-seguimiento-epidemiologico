@@ -14,6 +14,7 @@ Implementa validaciones para:
 - Registros fuera del periodo esperado.
 - Integridad de las claves.
 - Coherencia de las agregaciones.
+- Consistencia entre acumulados y suma de nuevos diarios.
 
 Genera reportes que permiten identificar problemas.
 No marca como correcto un conjunto de datos que tenga errores críticos sin resolver.
@@ -24,6 +25,7 @@ from typing import Optional
 
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 
 logger = logging.getLogger(__name__)
 
@@ -271,6 +273,104 @@ def validar_coherencia_casos_fallecimientos(df: DataFrame, nombre: str) -> dict:
     return resultado
 
 
+def validar_cumulativo_vs_suma(df: DataFrame, nombre: str,
+                               col_clave: str = "location_key",
+                               col_fecha: str = "date",
+                               col_nuevo: str = "new_confirmed",
+                               col_acumulado: str = "cumulative_confirmed") -> dict:
+    """
+    Verifica que el acumulado en cada fecha sea coherente con la suma
+    de los valores nuevos diarios desde el inicio de la serie.
+
+    Un acumulado que difiere en más de 1 unidad respecto a la suma ventana
+    indica que la serie tiene reinicios, correcciones no reflejadas o huecos
+    de reporte. Esto afecta directamente a calcular_tasa_contagio_por_pais,
+    que usa F.max("cumulative_confirmed") como total de casos del país.
+
+    La tolerancia de 1 unidad absorbe diferencias de redondeo o de la fecha
+    de inicio del acumulado cuando los datos arrancan con un valor previo.
+
+    Parámetros
+    ----------
+    df : DataFrame
+    nombre : str
+        Nombre del dataset para el reporte.
+    col_clave : str
+        Columna que identifica la ubicación (para particionar la ventana).
+    col_fecha : str
+        Columna de fecha (para ordenar la ventana).
+    col_nuevo : str
+        Columna de valores nuevos diarios (ej: new_confirmed).
+    col_acumulado : str
+        Columna de valores acumulados (ej: cumulative_confirmed).
+
+    Retorna
+    -------
+    dict
+        {
+            col_par: str,          # par de columnas evaluado
+            inconsistencias: int,  # registros donde |acumulado - suma_ventana| > 1
+            total_evaluados: int,  # registros con ambas columnas no nulas
+        }
+    """
+    logger.info("-" * 40)
+    logger.info("VALIDACIÓN ACUMULADO VS SUMA DIARIOS: %s (%s ~ %s)",
+                nombre, col_acumulado, col_nuevo)
+
+    cols_requeridas = [col_clave, col_fecha, col_nuevo, col_acumulado]
+    if not all(c in df.columns for c in cols_requeridas):
+        faltantes = [c for c in cols_requeridas if c not in df.columns]
+        logger.warning("  Columnas faltantes: %s. Se omite la validación.", faltantes)
+        return {"col_par": f"{col_acumulado}~{col_nuevo}", "inconsistencias": None,
+                "total_evaluados": None, "omitida": True}
+
+    # Ventana particionada por ubicación y ordenada por fecha: acumula new_confirmed
+    # desde la primera fila hasta la actual inclusive.
+    w = (
+        Window
+        .partitionBy(col_clave)
+        .orderBy(col_fecha)
+        .rowsBetween(Window.unboundedPreceding, Window.currentRow)
+    )
+
+    df_eval = (
+        df
+        .filter(
+            F.col(col_nuevo).isNotNull() &
+            F.col(col_acumulado).isNotNull() &
+            (F.col(col_nuevo) >= 0) &        # ignorar correcciones negativas
+            (F.col(col_acumulado) >= 0)
+        )
+        .withColumn("_suma_ventana", F.sum(F.col(col_nuevo)).over(w))
+        .withColumn("_diferencia", F.abs(F.col(col_acumulado) - F.col("_suma_ventana")))
+    )
+
+    total_evaluados = df_eval.count()
+    inconsistencias = df_eval.filter(F.col("_diferencia") > 1).count()
+
+    resultado = {
+        "col_par": f"{col_acumulado}~{col_nuevo}",
+        "inconsistencias": inconsistencias,
+        "total_evaluados": total_evaluados,
+        "omitida": False,
+    }
+
+    if total_evaluados == 0:
+        logger.warning("  No hay registros válidos para evaluar el acumulado.")
+    elif inconsistencias > 0:
+        pct = inconsistencias / total_evaluados * 100
+        logger.warning(
+            "  %d registros (%.1f%%) con |%s - suma(%s)| > 1. "
+            "La serie puede tener reinicios o correcciones no reflejadas en el acumulado. "
+            "F.max('%s') como total de casos puede ser inexacto.",
+            inconsistencias, pct, col_acumulado, col_nuevo, col_acumulado,
+        )
+    else:
+        logger.info("  Acumulado consistente con la suma de diarios. ✓")
+
+    return resultado
+
+
 def validar_integridad_claves(df: DataFrame, nombre: str,
                               col_clave: str = "location_key") -> dict:
     """
@@ -348,6 +448,19 @@ def generar_reporte_calidad(df: DataFrame, nombre: str,
         reporte["negativos"] = validar_negativos(df, nombre, columnas_conteos)
         reporte["coherencia"] = validar_coherencia_casos_fallecimientos(df, nombre)
 
+    # Validar que el acumulado de casos sea consistente con la suma de nuevos diarios.
+    # Solo tiene sentido cuando el dataset tiene fecha, location_key y ambas columnas
+    # de epidemiología (new_confirmed + cumulative_confirmed).
+    if (col_fecha and col_fecha in df.columns and
+            "new_confirmed" in df.columns and "cumulative_confirmed" in df.columns):
+        reporte["cumulativo_vs_suma"] = validar_cumulativo_vs_suma(
+            df, nombre,
+            col_clave=col_clave,
+            col_fecha=col_fecha,
+            col_nuevo="new_confirmed",
+            col_acumulado="cumulative_confirmed",
+        )
+
     reporte["claves"] = validar_integridad_claves(df, nombre, col_clave)
 
     # Determinar si hay errores críticos
@@ -409,6 +522,15 @@ def validar_todos_los_datasets(resultados_etl: dict) -> dict:
             columnas_criticas=["date", "location_key"],
             columnas_conteos=["new_confirmed", "new_deceased", "cumulative_confirmed", "cumulative_deceased"],
             columnas_clave=["date", "location_key"],
+        )
+        # Validar también el par de fallecidos (new_deceased ~ cumulative_deceased)
+        reportes["epidemiologia"]["cumulativo_vs_suma_deceased"] = validar_cumulativo_vs_suma(
+            resultados_etl["df_epidemiologia"],
+            nombre="epidemiologia",
+            col_clave="location_key",
+            col_fecha="date",
+            col_nuevo="new_deceased",
+            col_acumulado="cumulative_deceased",
         )
 
     # By-age
