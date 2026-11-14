@@ -268,8 +268,11 @@ def etapa_analisis_estadistico(resultados_etl: dict) -> bool:
             logger.warning("No hay datos por edad disponibles. No se puede ejecutar ANOVA.")
             return False
 
+        # Pasar también demographics para intentar calcular tasas aproximadas
+        df_demographics = resultados_etl.get("df_demographics")
+
         # Preparar datos
-        datos_preparados = preparar_datos_anova(df_by_age)
+        datos_preparados = preparar_datos_anova(df_by_age, df_demographics)
 
         if datos_preparados is None:
             logger.warning("No se pudieron preparar datos para ANOVA.")
