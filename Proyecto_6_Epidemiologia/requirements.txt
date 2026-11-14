@@ -1,0 +1,41 @@
+# Proyecto 6 — Seguimiento Epidemiológico de Enfermedades Respiratorias
+# Dependencias del proyecto
+#
+# IMPORTANTE: PySpark requiere Python 3.11 o 3.12. Python 3.14 tiene
+# incompatibilidades con el protocolo de workers de Spark.
+# Instalar Python 3.12 desde https://www.python.org/downloads/
+# y configurar PYSPARK_PYTHON apuntando a ese intérprete.
+#
+# Además, en Windows se necesita winutils.exe en C:\hadoop\bin\
+# (incluido automáticamente por spark_config.py al buscarlo en esa ruta).
+
+# Motor de procesamiento distribuido
+pyspark==4.0.0
+
+# Descarga de datos desde fuentes HTTP
+requests==2.32.3
+
+# Estadística científica
+scipy
+statsmodels
+numpy
+
+# Pandas (uso auxiliar exclusivamente para pruebas estadísticas)
+pandas
+
+# Pruebas automatizadas
+pytest==8.3.3
+
+# Notas de compatibilidad:
+# - PySpark 4.0.x requiere Java 8, 11, 17 o 21.
+# - Para verificar Java: ejecutar "java -version" en la terminal.
+# - Para verificar JAVA_HOME: ejecutar "$env:JAVA_HOME" en PowerShell.
+#
+# Instalación del entorno en Windows:
+#   1. Instalar Python 3.12 desde python.org
+#   2. Crear entorno virtual con Python 3.12:
+#      C:\Users\helen\AppData\Local\Programs\Python\Python312\python.exe -m venv venv
+#   3. Activar: .\venv\Scripts\Activate.ps1
+#   4. Instalar dependencias: pip install -r requirements.txt
+#   5. Descargar winutils.exe y hadoop.dll a C:\hadoop\bin\
+#      desde https://github.com/cdarlint/winutils (hadoop-3.3.6)

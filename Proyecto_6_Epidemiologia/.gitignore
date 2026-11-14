@@ -1,0 +1,47 @@
+# Entornos virtuales
+venv/
+.venv/
+env/
+
+# Datos crudos y procesados (archivos grandes, no se versionan)
+data/raw/
+data/staging/
+data/processed/
+
+# Logs generados en tiempo de ejecución
+logs/*.log
+logs/*.txt
+
+# Resultados estadísticos generados
+analisis_estadistico/resultados/*.txt
+analisis_estadistico/resultados/*.csv
+
+# Evidencias generadas
+evidencias/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.Python
+
+# Spark
+spark-warehouse/
+derby.log
+metastore_db/
+
+# Jupyter (si se usa como herramienta auxiliar)
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE y sistema operativo
+.idea/
+.vscode/
+*.DS_Store
+Thumbs.db
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
