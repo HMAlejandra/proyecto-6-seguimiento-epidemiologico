@@ -58,10 +58,13 @@ def csv_by_age_test(tmp_path):
     # Generar datos para 4 grupos etarios, 40 observaciones cada uno
     np.random.seed(42)
     grupos = ["0-9", "10-19", "20-29", "30-39"]
+    # Usar location_keys a nivel país (sin guion bajo) para que pasen
+    # el filtro de granularidad geográfica en preparar_datos_anova
+    paises = ["CO", "PE", "BR", "US", "AR"]
     for grupo in grupos:
         for i in range(40):
             fecha = f"2020-01-{(i % 28) + 1:02d}"
-            ubicacion = f"CO_Ciudad_{i % 5}"
+            ubicacion = paises[i % 5]
             valor = int(np.random.poisson(10))
             linea = f"{fecha},{ubicacion},{grupo},{valor},{valor * 10},{0}"
             lineas.append(linea)
@@ -90,7 +93,7 @@ class TestPreparacion:
     def test_preparacion_sin_datos_suficientes(self, spark, tmp_path):
         """Verifica que devuelva None si no hay datos suficientes."""
         ruta = tmp_path / "pocos_datos.csv"
-        ruta.write_text("date,location_key,age_bucket,new_confirmed\n2020-01-01,CO_1,0-9,5\n")
+        ruta.write_text("date,location_key,age_bucket,new_confirmed\n2020-01-01,CO,0-9,5\n")
         df = spark.read.option("header", True).csv(str(ruta))
         df = df.withColumn("new_confirmed", F.col("new_confirmed").cast("long"))
 
@@ -103,10 +106,10 @@ class TestPreparacion:
         ruta = tmp_path / "nulos.csv"
         ruta.write_text(
             "date,location_key,age_bucket,new_confirmed\n"
-            "2020-01-01,CO_1,0-9,5\n"
-            "2020-01-02,CO_1,0-9,\n"  # nulo
-            "2020-01-03,CO_1,0-9,-3\n"  # negativo
-            "2020-01-01,CO_2,10-19,7\n"
+            "2020-01-01,CO,0-9,5\n"
+            "2020-01-02,CO,0-9,\n"  # nulo
+            "2020-01-03,CO,0-9,-3\n"  # negativo
+            "2020-01-01,PE,10-19,7\n"
         )
         df = spark.read.option("header", True).csv(str(ruta))
         df = df.withColumn("new_confirmed", F.col("new_confirmed").cast("long"))

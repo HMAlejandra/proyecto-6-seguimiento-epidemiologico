@@ -105,10 +105,17 @@ def preparar_datos_anova(df_by_age: DataFrame) -> Optional[dict]:
                          col_name, df_by_age.columns)
             return None
 
-    # Filtrar datos: eliminar nulos y negativos en new_confirmed
+    # Filtrar datos:
+    # 1. Filtrar a nivel país para evitar mezclar granularidades geográficas.
+    #    Los datos de by-age.csv contienen filas a múltiples niveles (país, subregión,
+    #    municipio). Mezclarlas inflaría la varianza dentro de cada grupo etario
+    #    y sesgaría el ANOVA.
+    # 2. Eliminar nulos y negativos en new_confirmed.
+    num_guiones = F.size(F.split(F.col("location_key"), "_")) - 1
     df_filtrado = (
         df_by_age
         .filter(
+            (num_guiones == 0) &  # Solo nivel país (location_key sin guion bajo)
             F.col("age_bucket").isNotNull() &
             F.col("new_confirmed").isNotNull() &
             (F.col("new_confirmed") >= 0)
@@ -184,6 +191,8 @@ def preparar_datos_anova(df_by_age: DataFrame) -> Optional[dict]:
     limitaciones = [
         "Se utilizan conteos de new_confirmed, NO tasas. "
         "El archivo by-age.csv no incluye denominadores poblacionales por grupo etario.",
+        "Se filtran los datos a nivel país (location_key sin guion bajo) para "
+        "evitar mezclar granularidades geográficas que sesgarían el ANOVA.",
         "Las observaciones diarias consecutivas pueden estar correlacionadas "
         "(no hay independencia garantizada entre observaciones temporales).",
         "Los valores extremos pueden corresponder a correcciones acumuladas "
