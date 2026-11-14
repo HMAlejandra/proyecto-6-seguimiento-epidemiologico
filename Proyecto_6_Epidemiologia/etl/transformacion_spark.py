@@ -843,12 +843,22 @@ def calcular_tasa_contagio_por_pais(df_epidemiologia: DataFrame,
     # Filtrar a nivel país para evitar doble conteo
     df_pais = filtrar_nivel_geografico(df_epidemiologia, nivel="pais")
 
-    # Agregar casos totales por país
+    # Agregar casos totales por país.
+    # Se usa sum(new_confirmed) excluyendo negativos en lugar de
+    # max(cumulative_confirmed), porque los acumulados pueden tener reinicios
+    # o correcciones que hacen que el máximo no represente el total real.
+    # Esto es consistente con el resto de agregaciones del pipeline.
     agg_cols = []
-    if "cumulative_confirmed" in df_pais.columns:
-        agg_cols.append(F.max("cumulative_confirmed").alias("total_confirmed"))
     if "new_confirmed" in df_pais.columns:
-        agg_cols.append(F.sum("new_confirmed").alias("suma_new_confirmed"))
+        agg_cols.append(
+            F.sum(
+                F.when(F.col("new_confirmed") >= 0, F.col("new_confirmed"))
+            ).alias("total_confirmed")
+        )
+    if "cumulative_confirmed" in df_pais.columns:
+        # Se conserva el acumulado máximo como referencia informativa,
+        # pero NO se usa para calcular la tasa.
+        agg_cols.append(F.max("cumulative_confirmed").alias("max_cumulative_confirmed"))
 
     if "country_name" not in df_pais.columns:
         logger.warning("Falta country_name en epidemiologia. No se puede calcular tasa por país.")
