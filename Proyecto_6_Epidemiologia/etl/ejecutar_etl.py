@@ -349,7 +349,28 @@ def ejecutar_etl_completo(forzar_descarga: bool = False,
     resumen["etapas"]["transformacion"] = "OK"
 
     # 5. Calidad
-    etapa_calidad(resultados_etl)
+    reportes_calidad = etapa_calidad(resultados_etl)
+
+    # Evaluar estado de calidad: si algún dataset es CRÍTICO, el pipeline se detiene.
+    # Un estado CRÍTICO indica nulos en columnas clave o duplicados no eliminados,
+    # lo que produciría resultados incorrectos en el análisis estadístico.
+    datasets_criticos = [
+        nombre
+        for nombre, reporte in reportes_calidad.items()
+        if isinstance(reporte, dict) and reporte.get("estado") == "CRÍTICO"
+    ]
+    if datasets_criticos:
+        logger.error(
+            "Calidad de datos CRÍTICA en: %s. "
+            "El pipeline se detiene para evitar análisis con datos corruptos. "
+            "Revisa los logs de calidad y corrige los problemas antes de continuar.",
+            datasets_criticos,
+        )
+        stop_spark_session()
+        resumen["etapas"]["calidad"] = f"CRÍTICO — datasets afectados: {datasets_criticos}"
+        resumen["fin"] = datetime.now().isoformat()
+        return resumen
+
     resumen["etapas"]["calidad"] = "OK"
 
     # 6. Carga

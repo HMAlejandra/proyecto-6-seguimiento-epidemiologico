@@ -193,6 +193,20 @@ def convertir_tipos(df: DataFrame, columnas_tipo: dict) -> DataFrame:
                     "(de %d nulos a %d nulos).",
                     col_name, tipo_str, perdidos, nulos_antes, nulos_despues,
                 )
+                # Marcar las filas cuyo valor original no pudo convertirse.
+                # La columna flag (_cast_failed_<nombre>) es True exactamente en
+                # los registros que eran no-nulos antes del cast y nulos después.
+                # Permite trazabilidad: las validaciones de calidad y el ANOVA
+                # pueden distinguir "nulo de origen" de "nulo por conversión fallida".
+                flag_col = f"_cast_failed_{col_name}"
+                df = df.withColumn(
+                    flag_col,
+                    F.col(col_name).isNull() & F.lit(True)
+                )
+                logger.info(
+                    "Columna flag '%s' añadida para marcar %d filas con cast fallido.",
+                    flag_col, perdidos,
+                )
 
     return df
 

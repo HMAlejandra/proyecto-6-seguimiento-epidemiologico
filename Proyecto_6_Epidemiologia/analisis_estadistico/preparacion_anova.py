@@ -141,6 +141,19 @@ def preparar_datos_anova(df_by_age: DataFrame) -> Optional[dict]:
         return None
 
     # Extraer observaciones por grupo como arrays numpy
+    # Se agrega primero en Spark (sum de new_confirmed por age_bucket + fecha + ubicación)
+    # para evitar traer millones de filas individuales al driver con .collect().
+    # El dataset global COVID-19 puede tener cientos de miles de filas; hacer .collect()
+    # directamente sobre df_filtrado causaría OOM con los 4 GB de driver configurados.
+    # La agregación reduce el volumen a: (n_países × n_fechas) filas por grupo etario,
+    # que es manejable en memoria del driver.
+    df_agregado = (
+        df_filtrado
+        .groupBy("age_bucket", "date", "location_key")
+        .agg(F.sum("new_confirmed").alias("new_confirmed"))
+        .select("age_bucket", "new_confirmed")
+    )
+
     grupos_datos = {}
     metadatos_grupos = {}
 
@@ -148,7 +161,7 @@ def preparar_datos_anova(df_by_age: DataFrame) -> Optional[dict]:
 
     for grupo in lista_grupos:
         valores = (
-            df_filtrado
+            df_agregado
             .filter(F.col("age_bucket") == grupo)
             .select("new_confirmed")
             .collect()

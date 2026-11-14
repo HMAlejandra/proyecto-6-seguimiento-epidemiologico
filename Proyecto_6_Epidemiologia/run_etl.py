@@ -2,16 +2,36 @@
 import os
 import sys
 
-# Configurar entorno antes de importar cualquier módulo de Spark
-os.environ['HADOOP_HOME'] = r'C:\hadoop'
-os.environ['PYSPARK_PYTHON'] = r'C:\Users\helen\AppData\Local\Programs\Python\Python312\python.exe'
-os.environ['PYSPARK_DRIVER_PYTHON'] = r'C:\Users\helen\AppData\Local\Programs\Python\Python312\python.exe'
+# ---------------------------------------------------------------------------
+# Configuración de entorno para PySpark en Windows
+# ---------------------------------------------------------------------------
+# Las rutas se leen de variables de entorno para que el proyecto sea portable.
+# Establécelas antes de ejecutar este script si tus rutas son distintas:
+#
+#   PowerShell:
+#     $env:HADOOP_HOME       = "C:\hadoop"
+#     $env:PYSPARK_PYTHON_312 = "C:\Users\TU_USUARIO\...\Python312\python.exe"
+#
+# Si las variables no están definidas se usan los valores por defecto de
+# spark_config.py (C:\hadoop y la ruta de Helen), que seguirán funcionando
+# en la máquina original sin ningún cambio.
+# ---------------------------------------------------------------------------
+
+_hadoop_home = os.environ.get("HADOOP_HOME", r"C:\hadoop")
+_python_312  = os.environ.get(
+    "PYSPARK_PYTHON_312",
+    r"C:\Users\helen\AppData\Local\Programs\Python\Python312\python.exe",
+)
+
+os.environ["HADOOP_HOME"]             = _hadoop_home
+os.environ["PYSPARK_PYTHON"]          = _python_312
+os.environ["PYSPARK_DRIVER_PYTHON"]   = _python_312
 
 # Añadir hadoop\bin al PATH
-current_path = os.environ.get('PATH', '')
-hadoop_bin = r'C:\hadoop\bin'
-if hadoop_bin not in current_path:
-    os.environ['PATH'] = hadoop_bin + os.pathsep + current_path
+_hadoop_bin = os.path.join(_hadoop_home, "bin")
+_current_path = os.environ.get("PATH", "")
+if _hadoop_bin not in _current_path:
+    os.environ["PATH"] = _hadoop_bin + os.pathsep + _current_path
 
 # Añadir la raíz del proyecto al path
 project_root = os.path.dirname(os.path.abspath(__file__))
