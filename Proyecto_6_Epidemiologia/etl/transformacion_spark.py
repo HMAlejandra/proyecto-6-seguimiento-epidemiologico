@@ -182,11 +182,17 @@ def convertir_tipos(df: DataFrame, columnas_tipo: dict) -> DataFrame:
             # Convertir string a fecha
             df = df.withColumn(col_name, F.to_date(F.col(col_name), "yyyy-MM-dd"))
         elif tipo_str in tipo_map:
-            # Contar nulos antes del cast para detectar valores perdidos
+            # Guardar la columna original (string) ANTES del cast para poder
+            # distinguir a nivel de fila los nulos nuevos de los originales.
+            orig_col = f"_orig_{col_name}"
+            df = df.withColumn(orig_col, F.col(col_name))
+
+            # Contar nulos antes del cast para saber si hubo conversiones fallidas
             nulos_antes = df.filter(F.col(col_name).isNull()).count()
             df = df.withColumn(col_name, F.col(col_name).cast(tipo_map[tipo_str]))
             nulos_despues = df.filter(F.col(col_name).isNull()).count()
             perdidos = nulos_despues - nulos_antes
+
             if perdidos > 0:
                 logger.warning(
                     "Cast de '%s' a %s: %d valores no convertibles se volvieron null "
@@ -198,21 +204,34 @@ def convertir_tipos(df: DataFrame, columnas_tipo: dict) -> DataFrame:
                 # los registros que eran no-nulos antes del cast y nulos después.
                 # Permite trazabilidad: las validaciones de calidad y el ANOVA
                 # pueden distinguir "nulo de origen" de "nulo por conversión fallida".
+                #
+                # Bug corregido: la expresión anterior era
+                #   F.col(col_name).isNull() & F.lit(True)
+                # que equivale a isNull() y marcaba también los nulos originales
+                # del CSV, generando falsos positivos en generar_reporte_calidad()
+                # que abortaban el pipeline con estado CRÍTICO aunque los datos
+                # fueran válidos.
+                # La expresión correcta compara _orig (no-nulo = había valor)
+                # con la columna casteada (nula = conversión falló).
                 flag_col = f"_cast_failed_{col_name}"
                 df = df.withColumn(
                     flag_col,
-                    F.col(col_name).isNull() & F.lit(True)
+                    F.col(orig_col).isNotNull() & F.col(col_name).isNull()
                 )
                 logger.info(
                     "Columna flag '%s' añadida para marcar %d filas con cast fallido.",
                     flag_col, perdidos,
                 )
 
+            # Eliminar siempre la columna temporal, haya o no cast failures
+            df = df.drop(orig_col)
+
     return df
 
 
 def eliminar_duplicados(df: DataFrame, subset: list = None,
-                       orden_por: str = None) -> DataFrame:
+                       orden_por: str = None,
+                       contar_eliminados: bool = False) -> DataFrame:
     """
     Elimina filas duplicadas, conservando la primera ocurrencia.
 
@@ -231,12 +250,19 @@ def eliminar_duplicados(df: DataFrame, subset: list = None,
     orden_por : str, opcional
         Nombre de columna para ordenar descendente al desempatar.
         Si None, usa el orden natural de Spark.
+    contar_eliminados : bool, opcional
+        Si True, ejecuta df.count() antes y después de deduplicar para
+        loggear cuántos duplicados se eliminaron. Por defecto False.
+        ADVERTENCIA: sobre DataFrames grandes (>10 M filas) cada count()
+        desencadena un job Spark completo; actívalo solo cuando el diagnóstico
+        lo justifique.
 
     Retorna
     -------
     DataFrame sin duplicados.
     """
-    total_antes = df.count()
+    if contar_eliminados:
+        total_antes = df.count()
 
     if subset is None:
         df_limpio = df.dropDuplicates()
@@ -251,12 +277,16 @@ def eliminar_duplicados(df: DataFrame, subset: list = None,
     else:
         df_limpio = df.dropDuplicates(subset)
 
-    total_despues = df_limpio.count()
-    eliminados = total_antes - total_despues
-    if eliminados > 0:
-        logger.info("Duplicados eliminados: %d (de %d a %d)", eliminados, total_antes, total_despues)
+    if contar_eliminados:
+        total_despues = df_limpio.count()
+        eliminados = total_antes - total_despues
+        if eliminados > 0:
+            logger.info("Duplicados eliminados: %d (de %d a %d)", eliminados, total_antes, total_despues)
+        else:
+            logger.info("No se encontraron duplicados.")
     else:
-        logger.info("No se encontraron duplicados.")
+        logger.info("Deduplicación completada (contar_eliminados=False — sin count() adicionales).")
+
     return df_limpio
 
 
@@ -364,6 +394,44 @@ def filtrar_nivel_geografico(df: DataFrame, nivel: str = "pais",
 
 
 # ---------------------------------------------------------------------------
+# Normalización de etiquetas de grupos etarios
+# ---------------------------------------------------------------------------
+
+# Mapa de variantes conocidas del grupo "80+" que GCP ha usado en distintos dumps
+# hacia una etiqueta canónica única. Todas las demás etiquetas se conservan tal cual.
+_AGE_BUCKET_NORMALIZACION = {
+    "80-":    "80+",
+    "80-89":  "80+",
+    "80-99":  "80+",
+    "90+":    "80+",
+    "90-":    "80+",
+    "90-99":  "80+",
+    "100+":   "80+",
+}
+
+# Expresión Spark que aplica el mapa de normalización en una sola pasada.
+# Se construye como CASE WHEN ... ELSE age_bucket END para evitar N withColumn()
+# encadenados (uno por variante).
+def _expr_normalizar_age_bucket(col_name: str = "age_bucket"):
+    """
+    Construye una expresión Spark que reemplaza variantes del grupo '80+'
+    por la etiqueta canónica '80+'. El resto de etiquetas no se modifican.
+
+    Se usa F.when().when()...otherwise() en lugar de una UDF para mantenerse
+    dentro de la API Spark pura (más eficiente, compatible con optimizer).
+    """
+    expr = None
+    for variante, canonica in _AGE_BUCKET_NORMALIZACION.items():
+        condicion = F.col(col_name) == F.lit(variante)
+        if expr is None:
+            expr = F.when(condicion, F.lit(canonica))
+        else:
+            expr = expr.when(condicion, F.lit(canonica))
+    # Para cualquier etiqueta no listada en el mapa, conservar el valor original
+    return expr.otherwise(F.col(col_name)) if expr is not None else F.col(col_name)
+
+
+# ---------------------------------------------------------------------------
 # Transformaciones por archivo
 # ---------------------------------------------------------------------------
 
@@ -462,10 +530,25 @@ def transformar_by_age(spark) -> Optional[DataFrame]:
     # Convertir date a tipo fecha
     df = df.withColumn("date", F.to_date(F.col("date"), "yyyy-MM-dd"))
 
-    # Construir la expresión stack para unpivot en una sola pasada
-    # stack(n, col1_1, col1_2, col1_3, col1_4, col1_5, col2_1, col2_2, ...)
-    # produce n filas con 5 columnas cada una:
-    # age_bucket, new_confirmed, new_deceased, cumulative_confirmed, cumulative_deceased
+    # Construir la expresión stack para unpivot en una sola pasada.
+    # stack(n, col1_1, col1_2, ...) produce n filas con 5 columnas cada una:
+    # age_bucket, new_confirmed, new_deceased, cumulative_confirmed, cumulative_deceased.
+    #
+    # CORRECCIÓN: las columnas opcionales que no existen en el CSV se añaden al
+    # DataFrame como columnas nulas explícitas (F.lit(None).cast("string")) antes
+    # de construir la vista temporal. De esta forma, la expresión stack siempre
+    # referencia nombres de columnas reales y nunca inyecta SQL literal como
+    # "CAST(NULL AS STRING)", que se interpretaría como nombre de columna y
+    # produciría un error de análisis o un resultado incorrecto.
+    NULL_STR = F.lit(None).cast("string")
+    for i in range(10):
+        for col_opcional in [f"new_deceased_age_{i}",
+                             f"cumulative_confirmed_age_{i}",
+                             f"cumulative_deceased_age_{i}"]:
+            if col_opcional not in df.columns:
+                df = df.withColumn(col_opcional, NULL_STR)
+                logger.debug("Columna '%s' ausente en by-age.csv — añadida como NULL.", col_opcional)
+
     stack_args = []
     for i in range(10):
         age_bin = f"age_bin_{i}"
@@ -474,20 +557,7 @@ def transformar_by_age(spark) -> Optional[DataFrame]:
         cum_conf = f"cumulative_confirmed_age_{i}"
         cum_dec = f"cumulative_deceased_age_{i}"
         if age_bin in df.columns and new_conf in df.columns:
-            stack_args.append(age_bin)
-            stack_args.append(new_conf)
-            if new_dec in df.columns:
-                stack_args.append(new_dec)
-            else:
-                stack_args.append("CAST(NULL AS STRING)")
-            if cum_conf in df.columns:
-                stack_args.append(cum_conf)
-            else:
-                stack_args.append("CAST(NULL AS STRING)")
-            if cum_dec in df.columns:
-                stack_args.append(cum_dec)
-            else:
-                stack_args.append("CAST(NULL AS STRING)")
+            stack_args.extend([age_bin, new_conf, new_dec, cum_conf, cum_dec])
 
     num_cols_per_group = 5  # age_bucket, new_confirmed, new_deceased, cumulative_confirmed, cumulative_deceased
     num_groups = len(stack_args) // num_cols_per_group
@@ -508,6 +578,17 @@ def transformar_by_age(spark) -> Optional[DataFrame]:
 
     # Filtrar filas donde age_bucket es nulo
     df_long = df_long.filter(F.col("age_bucket").isNotNull())
+
+    # Normalizar etiquetas del grupo etario superior.
+    # GCP ha usado distintas variantes a lo largo del tiempo para el último
+    # grupo: "80-", "80-89", "80-99", "90+", etc. Sin normalización, el ANOVA
+    # trata cada variante como un grupo distinto, lo que rompe la comparación
+    # entre países y hace que preparar_datos_anova() no encuentre denominador
+    # poblacional para los buckets no listados en BUCKET_A_DEMOGRAPHICS.
+    # La función _expr_normalizar_age_bucket() convierte todas las variantes
+    # a la etiqueta canónica "80+" en una sola pasada, sin UDFs.
+    df_long = df_long.withColumn("age_bucket", _expr_normalizar_age_bucket("age_bucket"))
+    logger.info("Etiquetas de age_bucket normalizadas (variantes '80-x' → '80+').")
 
     # Convertir columnas numéricas de string a long
     # (el CSV se leyó con inferSchema=False, así que todas son strings)
@@ -781,9 +862,20 @@ def calcular_distribucion_por_edad(df_by_age: DataFrame) -> DataFrame:
         logger.warning("Columna 'age_bucket' no encontrada en by-age.")
         return df_pais
 
+    # Excluir negativos antes de agregar.
+    # Los negativos en datos de GCP son correcciones contables, no contagios reales.
+    # Sin este filtro, las sumas por grupo etario quedan subcontadas respecto a
+    # calcular_promedio_casos_por_pais() y calcular_evolucion_temporal(), que sí
+    # los excluyen, generando inconsistencia interna entre las métricas del proyecto.
+    filtros = F.col("age_bucket").isNotNull()
+    if "new_confirmed" in df_pais.columns:
+        filtros = filtros & (F.col("new_confirmed").isNull() | (F.col("new_confirmed") >= 0))
+    if "new_deceased" in df_pais.columns:
+        filtros = filtros & (F.col("new_deceased").isNull() | (F.col("new_deceased") >= 0))
+
     agg = (
         df_pais
-        .filter(F.col("age_bucket").isNotNull())
+        .filter(filtros)
         .groupBy("age_bucket")
         .agg(*agg_cols)
         .orderBy("age_bucket")

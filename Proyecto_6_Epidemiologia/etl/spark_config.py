@@ -27,13 +27,15 @@ logger = logging.getLogger(__name__)
 
 # Ruta al ejecutable de Python 3.12 (compatible con PySpark 4.0.0).
 # Python 3.14 (versión por defecto del sistema) tiene incompatibilidades con el
-# protocolo de workers de Spark, por lo que usamos Python 3.12 explícitamente.
+# protocolo de workers de Spark, por lo que se recomienda usar Python 3.12.
 #
-# Se lee de la variable de entorno PYSPARK_PYTHON_312 si está definida.
-# Si no, se intenta la ruta por defecto. Configura la variable antes de
-# lanzar el pipeline para hacer el proyecto portable entre máquinas:
+# Configura la variable de entorno PYSPARK_PYTHON_312 antes de lanzar el pipeline
+# para hacer el proyecto portable entre máquinas:
 #   $env:PYSPARK_PYTHON_312 = "C:\Users\TU_USUARIO\...\Python312\python.exe"
-_DEFAULT_PYTHON_312 = r"C:\Users\helen\AppData\Local\Programs\Python\Python312\python.exe"
+#
+# Si la variable no está definida y la ruta por defecto no existe, se usa
+# automáticamente el intérprete activo (sys.executable) como fallback.
+_DEFAULT_PYTHON_312 = r"C:\Python312\python.exe"
 PYTHON_312_PATH = os.environ.get("PYSPARK_PYTHON_312", _DEFAULT_PYTHON_312)
 
 # Ruta a la instalación de Hadoop (winutils.exe) necesaria para operaciones

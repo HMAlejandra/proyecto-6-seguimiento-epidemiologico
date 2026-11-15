@@ -339,53 +339,57 @@ def ejecutar_etl_completo(forzar_descarga: bool = False,
         etapa_exploracion()  # No aborta si falla
     resumen["etapas"]["exploracion"] = "OK" if not saltar_exploracion else "OMITIDA"
 
-    # 4. Transformación (requiere Spark)
+    # 4–7. Etapas que requieren Spark.
+    # El bloque try/finally garantiza que stop_spark_session() se ejecuta
+    # siempre, incluso si una etapa lanza una excepción no capturada internamente.
+    # Sin este bloque, un fallo en etapa_carga() o etapa_analisis_estadistico()
+    # dejaba la sesión JVM activa hasta el fin del proceso.
     spark = get_spark_session("ETL_Epidemiologia")
+    try:
+        # 4. Transformación
+        resultados_etl = etapa_transformacion(spark)
+        if not resultados_etl:
+            logger.error("Transformación falló. Abortando.")
+            resumen["etapas"]["transformacion"] = "FALLO"
+            resumen["fin"] = datetime.now().isoformat()
+            return resumen
+        resumen["etapas"]["transformacion"] = "OK"
 
-    resultados_etl = etapa_transformacion(spark)
-    if not resultados_etl:
-        logger.error("Transformación falló. Abortando.")
+        # 5. Calidad
+        reportes_calidad = etapa_calidad(resultados_etl)
+
+        # Evaluar estado de calidad: si algún dataset es CRÍTICO, el pipeline se detiene.
+        # Un estado CRÍTICO indica nulos en columnas clave o duplicados no eliminados,
+        # lo que produciría resultados incorrectos en el análisis estadístico.
+        datasets_criticos = [
+            nombre
+            for nombre, reporte in reportes_calidad.items()
+            if isinstance(reporte, dict) and reporte.get("estado") == "CRÍTICO"
+        ]
+        if datasets_criticos:
+            logger.error(
+                "Calidad de datos CRÍTICA en: %s. "
+                "El pipeline se detiene para evitar análisis con datos corruptos. "
+                "Revisa los logs de calidad y corrige los problemas antes de continuar.",
+                datasets_criticos,
+            )
+            resumen["etapas"]["calidad"] = f"CRÍTICO — datasets afectados: {datasets_criticos}"
+            resumen["fin"] = datetime.now().isoformat()
+            return resumen
+
+        resumen["etapas"]["calidad"] = "OK"
+
+        # 6. Carga
+        etapa_carga(resultados_etl)
+        resumen["etapas"]["carga"] = "OK"
+
+        # 7. Análisis estadístico
+        etapa_analisis_estadistico(resultados_etl)
+        resumen["etapas"]["analisis_estadistico"] = "OK"
+
+    finally:
+        # Cerrar Spark siempre, independientemente de éxito o excepción
         stop_spark_session()
-        resumen["etapas"]["transformacion"] = "FALLO"
-        resumen["fin"] = datetime.now().isoformat()
-        return resumen
-    resumen["etapas"]["transformacion"] = "OK"
-
-    # 5. Calidad
-    reportes_calidad = etapa_calidad(resultados_etl)
-
-    # Evaluar estado de calidad: si algún dataset es CRÍTICO, el pipeline se detiene.
-    # Un estado CRÍTICO indica nulos en columnas clave o duplicados no eliminados,
-    # lo que produciría resultados incorrectos en el análisis estadístico.
-    datasets_criticos = [
-        nombre
-        for nombre, reporte in reportes_calidad.items()
-        if isinstance(reporte, dict) and reporte.get("estado") == "CRÍTICO"
-    ]
-    if datasets_criticos:
-        logger.error(
-            "Calidad de datos CRÍTICA en: %s. "
-            "El pipeline se detiene para evitar análisis con datos corruptos. "
-            "Revisa los logs de calidad y corrige los problemas antes de continuar.",
-            datasets_criticos,
-        )
-        stop_spark_session()
-        resumen["etapas"]["calidad"] = f"CRÍTICO — datasets afectados: {datasets_criticos}"
-        resumen["fin"] = datetime.now().isoformat()
-        return resumen
-
-    resumen["etapas"]["calidad"] = "OK"
-
-    # 6. Carga
-    etapa_carga(resultados_etl)
-    resumen["etapas"]["carga"] = "OK"
-
-    # 7. Análisis estadístico
-    etapa_analisis_estadistico(resultados_etl)
-    resumen["etapas"]["analisis_estadistico"] = "OK"
-
-    # Cerrar Spark
-    stop_spark_session()
 
     resumen["fin"] = datetime.now().isoformat()
 

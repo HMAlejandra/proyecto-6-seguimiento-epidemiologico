@@ -22,8 +22,9 @@ import pytest
 
 # Configurar entorno antes de importar Spark
 os.environ.setdefault('HADOOP_HOME', r'C:\hadoop')
-os.environ.setdefault('PYSPARK_PYTHON', r'C:\Users\helen\AppData\Local\Programs\Python\Python312\python.exe')
-os.environ.setdefault('PYSPARK_DRIVER_PYTHON', r'C:\Users\helen\AppData\Local\Programs\Python\Python312\python.exe')
+# PYSPARK_PYTHON y PYSPARK_DRIVER_PYTHON se configuran en spark_config._configure_spark_env().
+# Para usar Python 3.12 define antes de ejecutar:
+#   $env:PYSPARK_PYTHON_312 = "C:\Users\TU_USUARIO\...\Python312\python.exe"
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
