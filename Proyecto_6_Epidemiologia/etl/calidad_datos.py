@@ -665,6 +665,30 @@ def generar_reporte_calidad(df: DataFrame, nombre: str,
         )
         errores_criticos += 1
 
+    # Acumulado vs suma de diarios: si más del 5 % de los registros evaluados
+    # muestran |cumulative_confirmed - suma_rolling(new_confirmed)| > 1, la serie
+    # tiene reinicios o correcciones que harían incorrectos los totales del ANOVA.
+    # Umbral del 5 %: tolera días aislados de ajuste sin bloquear el pipeline,
+    # pero detiene el análisis cuando los reinicios son sistemáticos.
+    reporte_cum = reporte.get("cumulativo_vs_suma", {})
+    if (not reporte_cum.get("omitida", True) and
+            reporte_cum.get("total_evaluados") and
+            reporte_cum["total_evaluados"] > 0 and
+            reporte_cum.get("inconsistencias") is not None):
+        pct_inconsistencias = reporte_cum["inconsistencias"] / reporte_cum["total_evaluados"]
+        if pct_inconsistencias > 0.05:
+            logger.warning(
+                "%s: %.1f%% de registros con acumulado inconsistente respecto a la suma de "
+                "diarios (%d de %d). La serie tiene reinicios o correcciones sistemáticas "
+                "que comprometen los totales del análisis estadístico — "
+                "se suma a errores críticos.",
+                nombre,
+                pct_inconsistencias * 100,
+                reporte_cum["inconsistencias"],
+                reporte_cum["total_evaluados"],
+            )
+            errores_criticos += 1
+
     # Cast failures en columnas de conteo (cast fallido = columna clave queda nula)
     for col_original, filas_fallidas in cast_failures.items():
         if filas_fallidas > 0:

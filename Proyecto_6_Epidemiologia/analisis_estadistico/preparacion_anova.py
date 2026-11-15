@@ -127,8 +127,83 @@ def _calcular_poblacion_por_bucket(df_demographics: DataFrame,
                        "Se omite el cruce.")
         return {}
 
+    # ---------------------------------------------------------------------------
+    # Validar que las proporciones de cada fila sumen ~1.0 antes de usarlas
+    # como denominador.
+    #
+    # demographics.csv almacena las fracciones etarias como proporciones de la
+    # población total (p.ej. population_age_00_09 = 0.17 → 17 % del país).
+    # Si están bien completadas, la suma de todos los grupos debe ser ≈ 1.0.
+    # Cuando suman muy por debajo de 0.85 significa que faltan grupos en el
+    # archivo (denominador subestimado → tasa sobreestimada) o que las
+    # proporciones están en otra escala (p.ej. 0–100 en lugar de 0–1).
+    # Cuando suman por encima de 1.15 indica doble conteo o escala incorrecta.
+    # En ambos casos la multiplicación population × proporción produce conteos
+    # de grupo etario erróneos, por lo que descartamos esas filas.
+    #
+    # Se usa el conjunto canónico de columnas (sin alias duplicados del grupo 80+)
+    # para evitar sumar la misma proporción más de una vez.
+    # ---------------------------------------------------------------------------
+    COLS_PROP_CANONICAS = [
+        "population_age_00_09", "population_age_10_19", "population_age_20_29",
+        "population_age_30_39", "population_age_40_49", "population_age_50_59",
+        "population_age_60_69", "population_age_70_79", "population_age_80_and_older",
+    ]
+    cols_prop_en_df = [c for c in COLS_PROP_CANONICAS if c in df_filtrado.columns]
+
+    TOLERANCIA_SUMA_MIN = 0.85
+    TOLERANCIA_SUMA_MAX = 1.15
+
+    if cols_prop_en_df:
+        # Calcular la suma de proporciones por fila para identificar filas inválidas
+        suma_props_expr = sum(
+            F.coalesce(F.col(c), F.lit(0.0)) for c in cols_prop_en_df
+        )
+        df_con_suma = df_filtrado.withColumn("_suma_props", suma_props_expr)
+
+        total_filas = df_con_suma.count()
+        filas_invalidas = df_con_suma.filter(
+            (F.col("_suma_props") < TOLERANCIA_SUMA_MIN) |
+            (F.col("_suma_props") > TOLERANCIA_SUMA_MAX)
+        ).count()
+
+        if filas_invalidas > 0:
+            pct_invalidas = filas_invalidas / total_filas * 100
+            logger.warning(
+                "DENOMINADORES POCO FIABLES: %d de %d filas de demographics (%.1f%%) "
+                "tienen proporciones etarias que suman fuera del rango [%.2f, %.2f]. "
+                "Esto indica proporciones incompletas o en escala incorrecta. "
+                "Se excluyen esas filas del cálculo del denominador para evitar "
+                "tasas de contagio sobreestimadas o subestimadas en el ANOVA.",
+                filas_invalidas, total_filas, pct_invalidas,
+                TOLERANCIA_SUMA_MIN, TOLERANCIA_SUMA_MAX,
+            )
+            df_filtrado = df_con_suma.filter(
+                (F.col("_suma_props") >= TOLERANCIA_SUMA_MIN) &
+                (F.col("_suma_props") <= TOLERANCIA_SUMA_MAX)
+            ).drop("_suma_props")
+
+            if df_filtrado.count() == 0:
+                logger.warning(
+                    "Ninguna fila de demographics superó la validación de proporciones. "
+                    "No se pueden calcular denominadores fiables. Se omite el cruce."
+                )
+                return {}
+        else:
+            logger.info(
+                "Validación de proporciones: las %d filas de demographics tienen "
+                "proporciones etarias dentro del rango esperado [%.2f, %.2f]. ✓",
+                total_filas, TOLERANCIA_SUMA_MIN, TOLERANCIA_SUMA_MAX,
+            )
+            df_filtrado = df_con_suma.drop("_suma_props")
+    else:
+        logger.warning(
+            "No se encontraron columnas canónicas de proporción etaria en demographics "
+            "para validar la suma. Se continúa sin esta validación."
+        )
+
     # Calcular población absoluta por grupo etario en cada fila y luego sumar
-    # Usamos la suma sobre todos los países para obtener el denominador global.
+    # sobre todos los países para obtener el denominador global.
     agg_exprs = []
     for bucket_label, col_prop in BUCKET_A_DEMOGRAPHICS.items():
         if col_prop in df_filtrado.columns:
@@ -386,7 +461,9 @@ def preparar_datos_anova(df_by_age: DataFrame,
         limitaciones = [
             "Las tasas se calculan como (new_confirmed / población_grupo_etario) × 100 000. "
             "Los denominadores son aproximaciones: demographics.csv almacena proporciones "
-            "de la población total del país, NO conteos absolutos por grupo etario.",
+            "de la población total del país, NO conteos absolutos por grupo etario. "
+            "Se validó que las proporciones de cada fila sumen entre 0.85 y 1.15; "
+            "las filas fuera de ese rango fueron excluidas del cálculo del denominador.",
             "Se filtra a nivel país para evitar mezclar granularidades geográficas.",
             "Las observaciones diarias consecutivas pueden estar correlacionadas "
             "(no hay independencia garantizada entre observaciones temporales).",
@@ -398,6 +475,11 @@ def preparar_datos_anova(df_by_age: DataFrame,
         tipo = "conteo (no tasa)"
         limitaciones = [
             razon_fallback or "Se utilizan conteos de new_confirmed, NO tasas.",
+            "ADVERTENCIA: Al trabajar con conteos absolutos (no tasas), los grupos etarios "
+            "más numerosos demográficamente producirán sistemáticamente más casos aunque su "
+            "riesgo relativo sea idéntico al de otros grupos. Un resultado estadísticamente "
+            "significativo puede reflejar diferencias de tamaño poblacional, no de riesgo "
+            "epidemiológico real.",
             "Se filtra a nivel país para evitar mezclar granularidades geográficas.",
             "Las observaciones diarias consecutivas pueden estar correlacionadas "
             "(no hay independencia garantizada entre observaciones temporales).",
