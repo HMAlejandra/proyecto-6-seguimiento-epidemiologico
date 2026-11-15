@@ -409,7 +409,8 @@ def validar_cumulativo_vs_suma(df: DataFrame, nombre: str,
                                col_clave: str = "location_key",
                                col_fecha: str = "date",
                                col_nuevo: str = "new_confirmed",
-                               col_acumulado: str = "cumulative_confirmed") -> dict:
+                               col_acumulado: str = "cumulative_confirmed",
+                               cols_particion: list = None) -> dict:
     """
     Verifica que el acumulado en cada fecha sea coherente con la suma
     de los valores nuevos diarios desde el inicio de la serie.
@@ -428,13 +429,21 @@ def validar_cumulativo_vs_suma(df: DataFrame, nombre: str,
     nombre : str
         Nombre del dataset para el reporte.
     col_clave : str
-        Columna que identifica la ubicación (para particionar la ventana).
+        Columna principal que identifica la ubicación.  Se incluye siempre
+        en la partición de la ventana.
     col_fecha : str
         Columna de fecha (para ordenar la ventana).
     col_nuevo : str
         Columna de valores nuevos diarios (ej: new_confirmed).
     col_acumulado : str
         Columna de valores acumulados (ej: cumulative_confirmed).
+    cols_particion : list, opcional
+        Columnas adicionales que deben incluirse en la partición de la ventana
+        además de ``col_clave``.  Necesario para datasets cuya clave compuesta
+        tenga más de una dimensión, como by-age (location_key + age_bucket):
+        sin ``age_bucket`` en la partición, la ventana acumula todos los grupos
+        etarios de un país juntos y la comparación contra el acumulado por grupo
+        resulta incorrecta.  Por defecto None (solo col_clave).
 
     Retorna
     -------
@@ -443,6 +452,7 @@ def validar_cumulativo_vs_suma(df: DataFrame, nombre: str,
             col_par: str,          # par de columnas evaluado
             inconsistencias: int,  # registros donde |acumulado - suma_ventana| > 1
             total_evaluados: int,  # registros con ambas columnas no nulas
+            omitida: bool,
         }
     """
     logger.info("-" * 40)
@@ -456,11 +466,27 @@ def validar_cumulativo_vs_suma(df: DataFrame, nombre: str,
         return {"col_par": f"{col_acumulado}~{col_nuevo}", "inconsistencias": None,
                 "total_evaluados": None, "omitida": True}
 
-    # Ventana particionada por ubicación y ordenada por fecha: acumula new_confirmed
-    # desde la primera fila hasta la actual inclusive.
+    # Construir la lista de columnas de partición.
+    # Siempre incluye col_clave; cols_particion añade dimensiones extra (ej: age_bucket).
+    particion = [col_clave]
+    if cols_particion:
+        for c in cols_particion:
+            if c not in particion and c in df.columns:
+                particion.append(c)
+            elif c not in df.columns:
+                logger.warning(
+                    "  Columna de partición extra '%s' no existe en el DataFrame '%s'. "
+                    "Se ignora.",
+                    c, nombre,
+                )
+
+    logger.info("  Partición de ventana: %s", particion)
+
+    # Ventana particionada por las columnas de clave y ordenada por fecha.
+    # Acumula col_nuevo desde la primera fila hasta la actual inclusive.
     w = (
         Window
-        .partitionBy(col_clave)
+        .partitionBy(*particion)
         .orderBy(col_fecha)
         .rowsBetween(Window.unboundedPreceding, Window.currentRow)
     )
@@ -583,14 +609,19 @@ def generar_reporte_calidad(df: DataFrame, nombre: str,
     # Validar que el acumulado de casos sea consistente con la suma de nuevos diarios.
     # Solo tiene sentido cuando el dataset tiene fecha, location_key y ambas columnas
     # de epidemiología (new_confirmed + cumulative_confirmed).
+    # Para by-age, la clave compuesta incluye age_bucket; sin él la ventana de suma
+    # acumularía todos los grupos etarios de un país juntos y la comparación sería
+    # incorrecta. Se detecta automáticamente si age_bucket está en el DataFrame.
     if (col_fecha and col_fecha in df.columns and
             "new_confirmed" in df.columns and "cumulative_confirmed" in df.columns):
+        cols_particion_extra = ["age_bucket"] if "age_bucket" in df.columns else None
         reporte["cumulativo_vs_suma"] = validar_cumulativo_vs_suma(
             df, nombre,
             col_clave=col_clave,
             col_fecha=col_fecha,
             col_nuevo="new_confirmed",
             col_acumulado="cumulative_confirmed",
+            cols_particion=cols_particion_extra,
         )
 
     reporte["claves"] = validar_integridad_claves(df, nombre, col_clave)
@@ -636,14 +667,19 @@ def generar_reporte_calidad(df: DataFrame, nombre: str,
             errores_criticos += 1
 
     # Tipos de datos incorrectos (columnas que quedaron como StringType en vez
-    # del tipo numérico esperado después del cast)
+    # del tipo numérico esperado después del cast).
+    # Se suma 1 único punto al contador, no uno por columna: el número de
+    # columnas afectadas ya queda registrado en el log. Sumar tipos_incorrectos
+    # directamente causaba que el mismo problema se contara dos veces (aquí y
+    # más abajo en cast_failures), ya que un cast fallido siempre produce a su
+    # vez un tipo incorrecto en el schema.
     tipos_incorrectos = reporte["tipos"].get("_tipos_incorrectos_total", 0)
     if tipos_incorrectos > 0:
         logger.warning(
-            "%s: %d columna(s) con tipo de dato incorrecto — se suma a errores críticos.",
+            "%s: %d columna(s) con tipo de dato incorrecto — se suma 1 a errores críticos.",
             nombre, tipos_incorrectos,
         )
-        errores_criticos += tipos_incorrectos
+        errores_criticos += 1
 
     # Negativos en columnas epidemiológicas principales
     if columnas_conteos:
@@ -689,10 +725,20 @@ def generar_reporte_calidad(df: DataFrame, nombre: str,
             )
             errores_criticos += 1
 
-    # Cast failures en columnas de conteo (cast fallido = columna clave queda nula)
-    for col_original, filas_fallidas in cast_failures.items():
-        if filas_fallidas > 0:
+    # Cast failures en columnas de conteo (cast fallido = columna clave queda nula).
+    # Solo se suman si tipos_incorrectos fue 0, para evitar doble conteo:
+    # un cast fallido siempre produce a su vez un tipo incorrecto en el schema,
+    # que ya fue contado en el bloque anterior. Si tipos_incorrectos > 0 el
+    # pipeline ya está marcado como CRÍTICO por ese motivo.
+    if tipos_incorrectos == 0:
+        hay_cast_failure = any(v > 0 for v in cast_failures.values())
+        if hay_cast_failure:
             errores_criticos += 1
+            logger.warning(
+                "%s: cast failures detectados en columnas de conteo — "
+                "se suma 1 a errores críticos.",
+                nombre,
+            )
 
     reporte["errores_criticos"] = errores_criticos
     reporte["estado"] = "CRÍTICO" if errores_criticos > 0 else "ACEPTABLE"
@@ -753,6 +799,16 @@ def validar_todos_los_datasets(resultados_etl: dict) -> dict:
             columnas_criticas=["date", "location_key", "age_bucket"],
             columnas_conteos=["new_confirmed", "new_deceased", "cumulative_confirmed"],
             columnas_clave=["date", "location_key", "age_bucket"],
+        )
+        # Validar el par de fallecidos con la partición correcta (location_key + age_bucket)
+        reportes["by_age"]["cumulativo_vs_suma_deceased"] = validar_cumulativo_vs_suma(
+            resultados_etl["df_by_age"],
+            nombre="by_age",
+            col_clave="location_key",
+            col_fecha="date",
+            col_nuevo="new_deceased",
+            col_acumulado="cumulative_deceased",
+            cols_particion=["age_bucket"],
         )
 
     # Demographics

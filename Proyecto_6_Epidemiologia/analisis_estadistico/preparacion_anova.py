@@ -261,9 +261,15 @@ def preparar_datos_anova(df_by_age: DataFrame,
 
     Decisiones metodológicas:
     - Se filtra a nivel país para no mezclar granularidades geográficas.
+    - Se filtra exclusivamente Colombia (location_key == "CO") para que el
+      ANOVA compare grupos etarios dentro de una misma población, sistema
+      sanitario y política epidemiológica.  Sin este filtro, el dataset global
+      mezcla todos los países del mundo, violando el supuesto de que los grupos
+      provienen de la misma población subyacente y produciendo diferencias que
+      reflejan heterogeneidad entre países, no entre grupos etarios.
     - Se filtran valores nulos y negativos en new_confirmed.
-    - Se agrega por (age_bucket, date, location_key) antes de collect() para
-      evitar OOM en el driver con el dataset global.
+    - Se agrega por (age_bucket, date) antes de collect() para
+      evitar OOM en el driver.
     - Si se calculan tasas: tasa = (new_confirmed / poblacion_bucket) * 100_000.
       Los denominadores poblacionales son proporciones de la población total
       del país, por lo que las tasas son aproximaciones documentadas.
@@ -309,13 +315,18 @@ def preparar_datos_anova(df_by_age: DataFrame,
             return None
 
     # Filtrar datos:
-    # 1. Solo nivel país (location_key sin guiones bajos) para evitar mezclar granularidades.
+    # 1. Solo Colombia a nivel país (location_key == "CO"):
+    #    - "CO" es el código ISO 3166-1 alpha-2 de Colombia.
+    #    - Sin este filtro el dataset incluye todos los países del mundo.
+    #      Mezclar sistemas sanitarios, densidades y políticas distintas viola
+    #      el supuesto de homogeneidad poblacional del ANOVA y puede producir
+    #      resultados significativos que reflejen diferencias entre países,
+    #      no entre grupos etarios dentro de Colombia.
     # 2. Eliminar nulos y negativos en new_confirmed.
-    num_guiones = F.size(F.split(F.col("location_key"), "_")) - 1
     df_filtrado = (
         df_by_age
         .filter(
-            (num_guiones == 0) &
+            (F.col("location_key") == F.lit("CO")) &
             F.col("age_bucket").isNotNull() &
             F.col("new_confirmed").isNotNull() &
             (F.col("new_confirmed") >= 0)
@@ -323,12 +334,17 @@ def preparar_datos_anova(df_by_age: DataFrame,
         .select("age_bucket", "new_confirmed", "date", "location_key")
     )
 
-    total_observaciones = df_filtrado.count()
-    logger.info("Total de observaciones válidas: %d", total_observaciones)
+    n_colombia = df_filtrado.count()
+    logger.info("Registros de Colombia (location_key='CO') para ANOVA: %d", n_colombia)
 
-    if total_observaciones == 0:
-        logger.error("No hay observaciones válidas para ANOVA.")
+    if n_colombia == 0:
+        logger.error(
+            "No hay registros de Colombia (location_key='CO') en by-age. "
+            "Verifica que el archivo by-age.csv contiene datos para Colombia."
+        )
         return None
+
+    total_observaciones = n_colombia
 
     # Identificar grupos etarios y location_keys disponibles
     grupos_rows = df_filtrado.select("age_bucket").distinct().orderBy("age_bucket").collect()
@@ -464,7 +480,8 @@ def preparar_datos_anova(df_by_age: DataFrame,
             "de la población total del país, NO conteos absolutos por grupo etario. "
             "Se validó que las proporciones de cada fila sumen entre 0.85 y 1.15; "
             "las filas fuera de ese rango fueron excluidas del cálculo del denominador.",
-            "Se filtra a nivel país para evitar mezclar granularidades geográficas.",
+            "Análisis restringido a Colombia (location_key='CO') para garantizar "
+            "homogeneidad de población, sistema sanitario y política epidemiológica.",
             "Las observaciones diarias consecutivas pueden estar correlacionadas "
             "(no hay independencia garantizada entre observaciones temporales).",
             "Los valores extremos pueden corresponder a correcciones acumuladas "
@@ -480,7 +497,8 @@ def preparar_datos_anova(df_by_age: DataFrame,
             "riesgo relativo sea idéntico al de otros grupos. Un resultado estadísticamente "
             "significativo puede reflejar diferencias de tamaño poblacional, no de riesgo "
             "epidemiológico real.",
-            "Se filtra a nivel país para evitar mezclar granularidades geográficas.",
+            "Análisis restringido a Colombia (location_key='CO') para garantizar "
+            "homogeneidad de población, sistema sanitario y política epidemiológica.",
             "Las observaciones diarias consecutivas pueden estar correlacionadas "
             "(no hay independencia garantizada entre observaciones temporales).",
             "Los valores extremos pueden corresponder a correcciones acumuladas "
@@ -498,6 +516,7 @@ def preparar_datos_anova(df_by_age: DataFrame,
             "variable": variable,
             "tipo": tipo,
             "usar_tasas": usar_tasas,
+            "pais": "CO",
             "n_grupos": len(lista_grupos),
             "n_observaciones_total": total_observaciones,
             "grupos_info": metadatos_grupos,

@@ -165,7 +165,32 @@ def convertir_tipos(df: DataFrame, columnas_tipo: dict) -> DataFrame:
 
     Retorna
     -------
-    DataFrame con las columnas convertidas.
+    DataFrame con las columnas convertidas y columnas flag
+    ``_cast_failed_<col>`` (booleanas) para cada columna numérica donde al
+    menos una fila no pudo convertirse.
+
+    Optimización de rendimiento
+    ---------------------------
+    La versión anterior ejecutaba dos ``df.filter(...).count()`` por cada
+    columna numérica para medir nulos antes/después del cast.  Sobre un
+    DataFrame con 8 columnas eso generaba 16 jobs Spark adicionales, cada uno
+    releyendo el CSV completo desde disco (el DF no estaba cacheado).
+
+    La versión actual reemplaza esos ``count()`` por columnas derivadas
+    calculadas dentro del plan lógico de Spark:
+
+    1. Se guarda ``_orig_<col>`` (valor original como string).
+    2. Se castea la columna al tipo destino.
+    3. Se añade ``_cast_failed_<col>`` = ``_orig.isNotNull() & col.isNull()``.
+       Esta expresión es True exactamente en las filas que tenían un valor no
+       nulo antes del cast y quedaron nulas después, es decir las que fallaron.
+    4. Se elimina ``_orig_<col>``.
+
+    La detección de cast failures queda embebida en el plan lógico y se evalúa
+    en un único job junto al resto de transformaciones, sin ``count()`` extra.
+    El número de filas fallidas se reporta sólo si ``generar_reporte_calidad``
+    detecta la columna flag; ese conteo se hace una única vez sobre el DF ya
+    transformado y cacheado.
     """
     tipo_map = {
         "long": LongType(),
@@ -182,48 +207,33 @@ def convertir_tipos(df: DataFrame, columnas_tipo: dict) -> DataFrame:
             # Convertir string a fecha
             df = df.withColumn(col_name, F.to_date(F.col(col_name), "yyyy-MM-dd"))
         elif tipo_str in tipo_map:
-            # Guardar la columna original (string) ANTES del cast para poder
-            # distinguir a nivel de fila los nulos nuevos de los originales.
+            # 1. Guardar la columna original (string) ANTES del cast.
             orig_col = f"_orig_{col_name}"
             df = df.withColumn(orig_col, F.col(col_name))
 
-            # Contar nulos antes del cast para saber si hubo conversiones fallidas
-            nulos_antes = df.filter(F.col(col_name).isNull()).count()
+            # 2. Castear al tipo destino.
             df = df.withColumn(col_name, F.col(col_name).cast(tipo_map[tipo_str]))
-            nulos_despues = df.filter(F.col(col_name).isNull()).count()
-            perdidos = nulos_despues - nulos_antes
 
-            if perdidos > 0:
-                logger.warning(
-                    "Cast de '%s' a %s: %d valores no convertibles se volvieron null "
-                    "(de %d nulos a %d nulos).",
-                    col_name, tipo_str, perdidos, nulos_antes, nulos_despues,
-                )
-                # Marcar las filas cuyo valor original no pudo convertirse.
-                # La columna flag (_cast_failed_<nombre>) es True exactamente en
-                # los registros que eran no-nulos antes del cast y nulos después.
-                # Permite trazabilidad: las validaciones de calidad y el ANOVA
-                # pueden distinguir "nulo de origen" de "nulo por conversión fallida".
-                #
-                # Bug corregido: la expresión anterior era
-                #   F.col(col_name).isNull() & F.lit(True)
-                # que equivale a isNull() y marcaba también los nulos originales
-                # del CSV, generando falsos positivos en generar_reporte_calidad()
-                # que abortaban el pipeline con estado CRÍTICO aunque los datos
-                # fueran válidos.
-                # La expresión correcta compara _orig (no-nulo = había valor)
-                # con la columna casteada (nula = conversión falló).
-                flag_col = f"_cast_failed_{col_name}"
-                df = df.withColumn(
-                    flag_col,
-                    F.col(orig_col).isNotNull() & F.col(col_name).isNull()
-                )
-                logger.info(
-                    "Columna flag '%s' añadida para marcar %d filas con cast fallido.",
-                    flag_col, perdidos,
-                )
+            # 3. Añadir columna flag para identificar filas donde el cast falló.
+            #    La expresión es True sólo cuando:
+            #      - el valor original era no-nulo (había algo que convertir), Y
+            #      - el valor casteado es nulo (la conversión falló).
+            #    Esto distingue "nulo de origen" (orig nulo → ambos nulos, flag=False)
+            #    de "nulo por cast fallido" (orig no-nulo → casteado nulo, flag=True).
+            #    No se usa count() aquí; el flag se evalúa lazily dentro del plan.
+            flag_col = f"_cast_failed_{col_name}"
+            df = df.withColumn(
+                flag_col,
+                F.col(orig_col).isNotNull() & F.col(col_name).isNull()
+            )
 
-            # Eliminar siempre la columna temporal, haya o no cast failures
+            logger.info(
+                "Cast de '%s' a %s programado. Flag '%s' añadida para detectar "
+                "filas no convertibles (se evalúa lazily, sin count() extra).",
+                col_name, tipo_str, flag_col,
+            )
+
+            # 4. Eliminar la columna temporal original.
             df = df.drop(orig_col)
 
     return df
