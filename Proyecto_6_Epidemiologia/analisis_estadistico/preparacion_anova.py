@@ -72,12 +72,17 @@ BUCKET_A_DEMOGRAPHICS = {
 def _calcular_poblacion_por_bucket(df_demographics: DataFrame,
                                    location_keys: list) -> dict:
     """
-    Calcula la población aproximada de cada grupo etario para las ubicaciones dadas.
+    Calcula la población por grupo etario para las ubicaciones dadas.
 
-    demographics.csv almacena las fracciones poblacionales como proporciones
-    de la población total (p.ej. population_age_00_09 = 0.17 significa que el
-    17 % de la población tiene 0-9 años).  Multiplicando por population se obtiene
-    el número absoluto de personas en ese grupo etario.
+    demographics.csv de GCP v3 puede almacenar las columnas population_age_*
+    en dos escalas distintas según el país:
+      - Conteos absolutos: population_age_00_09 = 7_414_155 (Colombia, suma ≈ population)
+      - Proporciones:      population_age_00_09 = 0.17      (suma ≈ 1.0)
+
+    Esta función detecta automáticamente la escala comparando la suma de las
+    columnas de edad con 1.0:
+      - Si suma > 1.5 → conteos absolutos → se usan directamente.
+      - Si suma ≤ 1.5 → proporciones → se multiplican por population.
 
     Como by-age.csv puede cubrir múltiples países, se suma la población de todos
     los location_keys recibidos para obtener el denominador total por bucket.
@@ -92,7 +97,7 @@ def _calcular_poblacion_por_bucket(df_demographics: DataFrame,
     Retorna
     -------
     dict
-        {age_bucket_label: poblacion_absoluta_aproximada}
+        {age_bucket_label: poblacion_absoluta}
         Vacío si el cruce no es posible.
     """
     if df_demographics is None:
@@ -128,21 +133,15 @@ def _calcular_poblacion_por_bucket(df_demographics: DataFrame,
         return {}
 
     # ---------------------------------------------------------------------------
-    # Validar que las proporciones de cada fila sumen ~1.0 antes de usarlas
-    # como denominador.
+    # Detectar si las columnas population_age_* son conteos absolutos o proporciones.
     #
-    # demographics.csv almacena las fracciones etarias como proporciones de la
-    # población total (p.ej. population_age_00_09 = 0.17 → 17 % del país).
-    # Si están bien completadas, la suma de todos los grupos debe ser ≈ 1.0.
-    # Cuando suman muy por debajo de 0.85 significa que faltan grupos en el
-    # archivo (denominador subestimado → tasa sobreestimada) o que las
-    # proporciones están en otra escala (p.ej. 0–100 en lugar de 0–1).
-    # Cuando suman por encima de 1.15 indica doble conteo o escala incorrecta.
-    # En ambos casos la multiplicación population × proporción produce conteos
-    # de grupo etario erróneos, por lo que descartamos esas filas.
+    # GCP v3 publica demographics con dos escalas distintas según el país y la versión:
+    #   - Proporciones: population_age_00_09 ≈ 0.17  (suma de todos los grupos ≈ 1.0)
+    #   - Conteos absolutos: population_age_00_09 ≈ 7_414_155 (suma ≈ population total)
     #
-    # Se usa el conjunto canónico de columnas (sin alias duplicados del grupo 80+)
-    # para evitar sumar la misma proporción más de una vez.
+    # Colombia (CO) usa conteos absolutos. El validador anterior rechazaba estas filas
+    # porque su suma (~50M) está muy lejos de [0.85, 1.15], impidiendo el cálculo de
+    # tasas para el ANOVA. Se corrige detectando la escala antes de procesar.
     # ---------------------------------------------------------------------------
     COLS_PROP_CANONICAS = [
         "population_age_00_09", "population_age_10_19", "population_age_20_29",
@@ -151,70 +150,82 @@ def _calcular_poblacion_por_bucket(df_demographics: DataFrame,
     ]
     cols_prop_en_df = [c for c in COLS_PROP_CANONICAS if c in df_filtrado.columns]
 
-    TOLERANCIA_SUMA_MIN = 0.85
-    TOLERANCIA_SUMA_MAX = 1.15
-
+    # Calcular la suma de las columnas de edad para la primera fila válida
+    # (usar la primera fila es suficiente para detectar la escala)
+    es_conteo_absoluto = False
     if cols_prop_en_df:
-        # Calcular la suma de proporciones por fila para identificar filas inválidas
-        suma_props_expr = sum(
-            F.coalesce(F.col(c), F.lit(0.0)) for c in cols_prop_en_df
-        )
-        df_con_suma = df_filtrado.withColumn("_suma_props", suma_props_expr)
-
-        total_filas = df_con_suma.count()
-        filas_invalidas = df_con_suma.filter(
-            (F.col("_suma_props") < TOLERANCIA_SUMA_MIN) |
-            (F.col("_suma_props") > TOLERANCIA_SUMA_MAX)
-        ).count()
-
-        if filas_invalidas > 0:
-            pct_invalidas = filas_invalidas / total_filas * 100
-            logger.warning(
-                "DENOMINADORES POCO FIABLES: %d de %d filas de demographics (%.1f%%) "
-                "tienen proporciones etarias que suman fuera del rango [%.2f, %.2f]. "
-                "Esto indica proporciones incompletas o en escala incorrecta. "
-                "Se excluyen esas filas del cálculo del denominador para evitar "
-                "tasas de contagio sobreestimadas o subestimadas en el ANOVA.",
-                filas_invalidas, total_filas, pct_invalidas,
-                TOLERANCIA_SUMA_MIN, TOLERANCIA_SUMA_MAX,
+        primera_fila = df_filtrado.select(
+            ["population"] + cols_prop_en_df
+        ).first()
+        if primera_fila:
+            suma_edad = sum(
+                float(primera_fila[c]) for c in cols_prop_en_df
+                if primera_fila[c] is not None
             )
-            df_filtrado = df_con_suma.filter(
-                (F.col("_suma_props") >= TOLERANCIA_SUMA_MIN) &
-                (F.col("_suma_props") <= TOLERANCIA_SUMA_MAX)
-            ).drop("_suma_props")
+            pop_total = float(primera_fila["population"]) if primera_fila["population"] else 1.0
 
-            if df_filtrado.count() == 0:
-                logger.warning(
-                    "Ninguna fila de demographics superó la validación de proporciones. "
-                    "No se pueden calcular denominadores fiables. Se omite el cruce."
-                )
-                return {}
-        else:
-            logger.info(
-                "Validación de proporciones: las %d filas de demographics tienen "
-                "proporciones etarias dentro del rango esperado [%.2f, %.2f]. ✓",
-                total_filas, TOLERANCIA_SUMA_MIN, TOLERANCIA_SUMA_MAX,
-            )
-            df_filtrado = df_con_suma.drop("_suma_props")
-    else:
-        logger.warning(
-            "No se encontraron columnas canónicas de proporción etaria en demographics "
-            "para validar la suma. Se continúa sin esta validación."
-        )
+            if suma_edad > 1.5:
+                # Suma >> 1 → son conteos absolutos
+                es_conteo_absoluto = True
+                # Validar que la suma de grupos sea coherente con la población total
+                # (tolerancia del 5% para cubrir diferencias de redondeo o grupos faltantes)
+                if pop_total > 0:
+                    ratio = suma_edad / pop_total
+                    if ratio < 0.80 or ratio > 1.05:
+                        logger.warning(
+                            "Las columnas de edad suman %.0f pero population=%.0f "
+                            "(ratio=%.2f). Puede haber grupos etarios faltantes. "
+                            "Los denominadores del ANOVA pueden estar subestimados.",
+                            suma_edad, pop_total, ratio,
+                        )
+                    else:
+                        logger.info(
+                            "Columnas population_age_* detectadas como CONTEOS ABSOLUTOS "
+                            "(suma=%.0f, population=%.0f, ratio=%.3f). "
+                            "Se usarán directamente como denominadores sin multiplicar por population.",
+                            suma_edad, pop_total, ratio,
+                        )
+            else:
+                # Suma ≈ 1 → son proporciones
+                es_conteo_absoluto = False
+                if suma_edad < 0.85 or suma_edad > 1.15:
+                    logger.warning(
+                        "Las proporciones etarias suman %.4f (fuera del rango [0.85, 1.15]). "
+                        "Pueden estar incompletas. Los denominadores pueden ser inexactos.",
+                        suma_edad,
+                    )
+                else:
+                    logger.info(
+                        "Columnas population_age_* detectadas como PROPORCIONES "
+                        "(suma=%.4f). Se multiplicarán por population para obtener conteos.",
+                        suma_edad,
+                    )
 
-    # Calcular población absoluta por grupo etario en cada fila y luego sumar
-    # sobre todos los países para obtener el denominador global.
+    # Calcular población por grupo etario según la escala detectada
     agg_exprs = []
     for bucket_label, col_prop in BUCKET_A_DEMOGRAPHICS.items():
         if col_prop in df_filtrado.columns:
-            agg_exprs.append(
-                F.sum(
-                    F.when(
-                        F.col(col_prop).isNotNull() & (F.col(col_prop) > 0),
-                        F.col("population") * F.col(col_prop)
-                    ).otherwise(F.lit(0.0))
-                ).alias(f"pop_{bucket_label.replace('-', '_').replace('+', 'plus')}")
-            )
+            if es_conteo_absoluto:
+                # Las columnas ya son conteos absolutos: sumar directamente
+                agg_exprs.append(
+                    F.sum(
+                        F.when(
+                            F.col(col_prop).isNotNull() & (F.col(col_prop) > 0),
+                            F.col(col_prop).cast("double")
+                        ).otherwise(F.lit(0.0))
+                    ).alias(f"pop_{bucket_label.replace('-', '_').replace('+', 'plus')}")
+                )
+            else:
+                # Las columnas son proporciones: multiplicar por population para
+                # obtener el conteo absoluto estimado de personas en ese grupo.
+                agg_exprs.append(
+                    F.sum(
+                        F.when(
+                            F.col(col_prop).isNotNull() & (F.col(col_prop) > 0),
+                            F.col("population") * F.col(col_prop).cast("double")
+                        ).otherwise(F.lit(0.0))
+                    ).alias(f"pop_{bucket_label.replace('-', '_').replace('+', 'plus')}")
+                )
 
     if not agg_exprs:
         return {}
@@ -399,7 +410,9 @@ def preparar_datos_anova(df_by_age: DataFrame,
             usar_tasas = True
             logger.info(
                 "Cruce con demographics exitoso. Se calcularán tasas por 100 000 hab. "
-                "(denominadores aproximados basados en proporciones poblacionales)."
+                "(%s).",
+                "denominadores: conteos absolutos exactos" if poblacion_por_bucket else
+                "denominadores: proporciones de la población total — tasas aproximadas",
             )
     else:
         razon_fallback = (
@@ -473,13 +486,13 @@ def preparar_datos_anova(df_by_age: DataFrame,
     # Documentar limitaciones
     if usar_tasas:
         variable = "tasa_por_100k_aprox"
-        tipo = "tasa aproximada por 100 000 hab. (denominador basado en proporciones de demographics)"
+        tipo = "tasa por 100 000 hab. (denominadores de demographics.csv)"
         limitaciones = [
             "Las tasas se calculan como (new_confirmed / población_grupo_etario) × 100 000. "
-            "Los denominadores son aproximaciones: demographics.csv almacena proporciones "
-            "de la población total del país, NO conteos absolutos por grupo etario. "
-            "Se validó que las proporciones de cada fila sumen entre 0.85 y 1.15; "
-            "las filas fuera de ese rango fueron excluidas del cálculo del denominador.",
+            "Los denominadores provienen de demographics.csv. Para Colombia, las columnas "
+            "population_age_* son conteos absolutos de personas por grupo etario (exactos). "
+            "Para países donde son proporciones de la población total, el denominador es "
+            "una estimación. La escala se detecta automáticamente.",
             "Análisis restringido a Colombia (location_key='CO') para garantizar "
             "homogeneidad de población, sistema sanitario y política epidemiológica.",
             "Las observaciones diarias consecutivas pueden estar correlacionadas "

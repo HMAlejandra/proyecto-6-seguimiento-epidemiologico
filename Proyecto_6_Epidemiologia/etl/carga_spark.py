@@ -37,6 +37,23 @@ def _ensure_dirs():
     PROCESSED_PARQUET_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _limpiar_columnas_internas(df: DataFrame) -> DataFrame:
+    """
+    Elimina las columnas auxiliares generadas internamente por el pipeline
+    antes de escribir los archivos finales.
+
+    Las columnas _cast_failed_* son flags de diagnóstico útiles durante la
+    validación de calidad, pero no deben aparecer en los CSVs y Parquets
+    que consume Power BI u otros sistemas externos.
+    """
+    cols_a_eliminar = [c for c in df.columns if c.startswith("_cast_failed_")]
+    if cols_a_eliminar:
+        logger.info("Eliminando %d columnas internas antes de guardar: %s",
+                    len(cols_a_eliminar), cols_a_eliminar)
+        df = df.drop(*cols_a_eliminar)
+    return df
+
+
 def escribir_csv(df: DataFrame, nombre: str, directorio: Path,
                  particiones: int = 1) -> bool:
     """
@@ -166,38 +183,16 @@ def verificar_parquet(ruta: Path) -> bool:
 def guardar_en_staging(df: DataFrame, nombre: str) -> bool:
     """
     Guarda un DataFrame en data/staging/ en formato Parquet.
-
-    Parámetros
-    ----------
-    df : DataFrame
-    nombre : str
-        Nombre del conjunto de datos.
-
-    Retorna
-    -------
-    bool
-        True si la escritura fue exitosa.
     """
+    df = _limpiar_columnas_internas(df)
     return escribir_parquet(df, nombre, STAGING_DIR)
 
 
 def guardar_en_processed(df: DataFrame, nombre: str) -> dict:
     """
     Guarda un DataFrame en data/processed/ en CSV y Parquet.
-
-    Ambos formatos representan los mismos datos.
-
-    Parámetros
-    ----------
-    df : DataFrame
-    nombre : str
-        Nombre del conjunto de datos.
-
-    Retorna
-    -------
-    dict
-        {csv: bool, parquet: bool, csv_verificado: bool, parquet_verificado: bool}
     """
+    df = _limpiar_columnas_internas(df)
     resultado = {}
 
     # Escribir CSV

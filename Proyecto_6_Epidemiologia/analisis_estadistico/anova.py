@@ -463,30 +463,38 @@ Tamaño de muestra por grupo:
     else:
         resultados["decision"] = {"error": "No se pudo calcular el valor p principal."}
 
-    # 5. Advertencia metodológica sobre conteos vs tasas
-    # El análisis usa new_confirmed (conteos absolutos), no tasas por población.
-    # Esto se debe a que by-age.csv no incluye denominadores poblacionales por
-    # grupo etario. Un grupo etario en un país más poblado tendrá naturalmente
-    # más casos aunque su tasa de riesgo sea igual. Esta limitación se propaga
-    # al resultado: una diferencia significativa puede reflejar diferencias de
-    # tamaño poblacional entre grupos, no diferencias de riesgo de contagio.
-    advertencia_conteos = (
-        "\n⚠ ADVERTENCIA METODOLÓGICA — CONTEOS VS TASAS\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Este análisis usa new_confirmed (conteos absolutos de casos), NO tasas de contagio.\n"
-        "La pregunta de investigación menciona 'tasas de contagio por grupo etario', pero\n"
-        "by-age.csv no incluye denominadores poblacionales por grupo etario.\n\n"
-        "Implicación: grupos etarios más numerosos (ej. adultos de 30-50 años) tendrán\n"
-        "sistemáticamente más casos que grupos menos numerosos (ej. mayores de 80),\n"
-        "incluso si su riesgo relativo de contagio es menor. Un resultado estadísticamente\n"
-        "significativo puede deberse a diferencias de tamaño poblacional entre grupos,\n"
-        "no a diferencias reales de riesgo epidemiológico.\n\n"
-        "Para calcular tasas verdaderas se requiere la población por grupo etario,\n"
-        "que no está disponible en esta fuente de datos.\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    )
-    logger.warning(advertencia_conteos)
-    resultados["advertencia_metodologica"] = advertencia_conteos.strip()
+    # 5. Advertencia metodológica sobre conteos vs tasas.
+    # Solo se muestra si preparacion_anova no pudo calcular tasas reales
+    # (usar_tasas=False). Si se calcularon tasas aproximadas con demographics,
+    # emitir esta advertencia sería factualmente incorrecto.
+    usar_tasas = metadatos.get("usar_tasas", False)
+    if not usar_tasas:
+        advertencia_conteos = (
+            "\n⚠ ADVERTENCIA METODOLÓGICA — CONTEOS VS TASAS\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Este análisis usa new_confirmed (conteos absolutos de casos), NO tasas de contagio.\n"
+            "La pregunta de investigación menciona 'tasas de contagio por grupo etario', pero\n"
+            "el cruce con demographics no fue posible o no produjo denominadores válidos.\n\n"
+            "Implicación: grupos etarios más numerosos (ej. adultos de 30-50 años) tendrán\n"
+            "sistemáticamente más casos que grupos menos numerosos (ej. mayores de 80),\n"
+            "incluso si su riesgo relativo de contagio es menor. Un resultado estadísticamente\n"
+            "significativo puede deberse a diferencias de tamaño poblacional entre grupos,\n"
+            "no a diferencias reales de riesgo epidemiológico.\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        )
+        logger.warning(advertencia_conteos)
+        resultados["advertencia_metodologica"] = advertencia_conteos.strip()
+    else:
+        nota_tasas = (
+            "\nℹ VARIABLE ANALIZADA: tasas aproximadas por 100 000 hab.\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Se calcularon tasas aproximadas usando denominadores de demographics.csv.\n"
+            "Los denominadores son proporciones de la población total del país, NO conteos\n"
+            "absolutos por grupo etario; las tasas son aproximaciones documentadas.\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        )
+        logger.info(nota_tasas)
+        resultados["advertencia_metodologica"] = nota_tasas.strip()
 
     # 6. Guardar resultados
     _guardar_resultado_completo(resultados)
