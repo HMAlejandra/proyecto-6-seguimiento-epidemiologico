@@ -916,7 +916,11 @@ def calcular_evolucion_temporal(df_epidemiologia: DataFrame) -> DataFrame:
     if "new_deceased" in df_pais.columns:
         agg_cols.append(F.sum("new_deceased").alias("total_new_deceased"))
     if "cumulative_confirmed" in df_pais.columns:
-        agg_cols.append(F.max("cumulative_confirmed").alias("max_cumulative_confirmed"))
+        # SUM en lugar de MAX: el MAX por fecha solo devuelve el acumulado del
+        # país con más casos ese día, no el total global. Para la evolución
+        # temporal mundial se necesita la suma de los acumulados de todos
+        # los países en cada fecha.
+        agg_cols.append(F.sum("cumulative_confirmed").alias("total_cumulative_confirmed"))
 
     # Excluir negativos para que la evolución temporal sea coherente con el
     # filtrado aplicado en el ANOVA (preparar_datos_anova excluye new_confirmed < 0).
@@ -1240,7 +1244,7 @@ def calcular_relacion_clima_contagios(df_epidemiologia: DataFrame,
     df_epi_sel = df_epi_pais.select(*[c for c in epi_cols if c in df_epi_pais.columns])
     df_weather_sel = df_weather_pais.select(*[c for c in weather_cols if c in df_weather_pais.columns])
 
-    df_join = df_epi_sel.join(df_weather_sel, on=["date", "location_key"], how="inner")
+    df_join = df_epi_sel.join(df_weather_sel, on=["date", "location_key"], how="left")
 
     logger.info("Datos clima-contagios preparados: %d filas.", df_join.count())
     return df_join
