@@ -463,7 +463,32 @@ Tamaño de muestra por grupo:
     else:
         resultados["decision"] = {"error": "No se pudo calcular el valor p principal."}
 
-    # 5. Guardar resultados
+    # 5. Advertencia metodológica sobre conteos vs tasas
+    # El análisis usa new_confirmed (conteos absolutos), no tasas por población.
+    # Esto se debe a que by-age.csv no incluye denominadores poblacionales por
+    # grupo etario. Un grupo etario en un país más poblado tendrá naturalmente
+    # más casos aunque su tasa de riesgo sea igual. Esta limitación se propaga
+    # al resultado: una diferencia significativa puede reflejar diferencias de
+    # tamaño poblacional entre grupos, no diferencias de riesgo de contagio.
+    advertencia_conteos = (
+        "\n⚠ ADVERTENCIA METODOLÓGICA — CONTEOS VS TASAS\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Este análisis usa new_confirmed (conteos absolutos de casos), NO tasas de contagio.\n"
+        "La pregunta de investigación menciona 'tasas de contagio por grupo etario', pero\n"
+        "by-age.csv no incluye denominadores poblacionales por grupo etario.\n\n"
+        "Implicación: grupos etarios más numerosos (ej. adultos de 30-50 años) tendrán\n"
+        "sistemáticamente más casos que grupos menos numerosos (ej. mayores de 80),\n"
+        "incluso si su riesgo relativo de contagio es menor. Un resultado estadísticamente\n"
+        "significativo puede deberse a diferencias de tamaño poblacional entre grupos,\n"
+        "no a diferencias reales de riesgo epidemiológico.\n\n"
+        "Para calcular tasas verdaderas se requiere la población por grupo etario,\n"
+        "que no está disponible en esta fuente de datos.\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    )
+    logger.warning(advertencia_conteos)
+    resultados["advertencia_metodologica"] = advertencia_conteos.strip()
+
+    # 6. Guardar resultados
     _guardar_resultado_completo(resultados)
 
     logger.info("=" * 60)
@@ -576,6 +601,16 @@ def _guardar_resultado_completo(resultados: dict):
         contenido.append(f"\nInterpretación:\n{decision['interpretacion']}\n")
     elif decision.get("error"):
         contenido.append(f"Error: {decision['error']}\n")
+
+    contenido.append("\n" + "=" * 60 + "\n")
+    contenido.append("ADVERTENCIA METODOLÓGICA\n")
+    contenido.append("=" * 60 + "\n")
+    contenido.append(
+        "Este análisis usa new_confirmed (conteos absolutos), NO tasas de contagio.\n"
+        "by-age.csv no incluye denominadores poblacionales por grupo etario.\n"
+        "Un resultado significativo puede deberse a diferencias de tamaño poblacional\n"
+        "entre grupos, no a diferencias reales de riesgo epidemiológico.\n"
+    )
 
     contenido.append("\n" + "=" * 60 + "\n")
     contenido.append("LIMITACIONES\n")

@@ -14,6 +14,7 @@ Implementa validaciones para:
 - Registros fuera del periodo esperado.
 - Integridad de las claves.
 - Coherencia de las agregaciones.
+- Consistencia entre acumulados y suma de nuevos diarios.
 
 Genera reportes que permiten identificar problemas.
 No marca como correcto un conjunto de datos que tenga errores críticos sin resolver.
@@ -24,6 +25,7 @@ from typing import Optional
 
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 
 logger = logging.getLogger(__name__)
 
@@ -118,23 +120,107 @@ def validar_duplicados(df: DataFrame, nombre: str,
     return resultado
 
 
+# Schema esperado por dataset: define qué tipo PySpark debe tener cada columna
+# luego de que convertir_tipos() haya actuado. Se usa en validar_tipos() para
+# detectar columnas que quedaron como StringType cuando debían ser numéricas.
+SCHEMA_ESPERADO = {
+    # Epidemiología
+    "new_confirmed": "LongType",
+    "new_deceased": "LongType",
+    "new_recovered": "LongType",
+    "new_tested": "LongType",
+    "cumulative_confirmed": "LongType",
+    "cumulative_deceased": "LongType",
+    "cumulative_recovered": "LongType",
+    "cumulative_tested": "LongType",
+    # By-age
+    "new_confirmed_age": "LongType",
+    "new_deceased_age": "LongType",
+    "cumulative_confirmed_age": "LongType",
+    "cumulative_deceased_age": "LongType",
+    # Demographics
+    "population": "LongType",
+    "population_male": "LongType",
+    "population_female": "LongType",
+    "population_rural": "LongType",
+    "population_urban": "LongType",
+    "population_density": "DoubleType",
+    "human_development_index": "DoubleType",
+    # Weather
+    "average_temperature_celsius": "DoubleType",
+    "minimum_temperature_celsius": "DoubleType",
+    "maximum_temperature_celsius": "DoubleType",
+    "rainfall_mm": "DoubleType",
+    "snowfall_mm": "DoubleType",
+    "dew_point": "DoubleType",
+    "relative_humidity": "DoubleType",
+    # Hospitalizaciones
+    "new_hospitalized_patients": "LongType",
+    "cumulative_hospitalized_patients": "LongType",
+    "current_hospitalized_patients": "LongType",
+    "new_intensive_care_patients": "LongType",
+    "cumulative_intensive_care_patients": "LongType",
+    "current_intensive_care_patients": "LongType",
+    "new_ventilator_patients": "LongType",
+    "cumulative_ventilator_patients": "LongType",
+    "current_ventilator_patients": "LongType",
+    # Claves y fechas
+    "date": "DateType",
+    "location_key": "StringType",
+    "age_bucket": "StringType",
+}
+
+
 def validar_tipos(df: DataFrame, nombre: str) -> dict:
     """
     Verifica que las columnas tengan los tipos de datos esperados.
 
+    Compara cada columna presente en el DataFrame contra SCHEMA_ESPERADO.
+    Las columnas con tipo incorrecto se marcan como "tipo_incorrecto" en el
+    resultado y se registran como ADVERTENCIA en el log.
+
     Retorna
     -------
     dict
-        {columna: tipo_actual}
+        {columna: {"tipo_actual": str, "tipo_esperado": str|None, "tipo_incorrecto": bool}}
     """
     logger.info("-" * 40)
     logger.info("VALIDACIÓN DE TIPOS: %s", nombre)
 
     resultado = {}
-    for field in df.schema.fields:
-        resultado[field.name] = str(field.dataType)
-        logger.info("  %s: %s", field.name, field.dataType)
+    tipos_incorrectos = 0
 
+    for field in df.schema.fields:
+        tipo_actual = type(field.dataType).__name__
+        tipo_esperado = SCHEMA_ESPERADO.get(field.name)
+        incorrecto = tipo_esperado is not None and tipo_actual != tipo_esperado
+
+        resultado[field.name] = {
+            "tipo_actual": tipo_actual,
+            "tipo_esperado": tipo_esperado,
+            "tipo_incorrecto": incorrecto,
+        }
+
+        if incorrecto:
+            logger.warning(
+                "  [TIPO INCORRECTO] %s: esperado %s, encontrado %s",
+                field.name, tipo_esperado, tipo_actual,
+            )
+            tipos_incorrectos += 1
+        else:
+            logger.info("  %s: %s%s", field.name, tipo_actual,
+                        " (esperado)" if tipo_esperado else "")
+
+    if tipos_incorrectos > 0:
+        logger.warning(
+            "%s: %d columna(s) con tipo incorrecto. "
+            "Pueden ser columnas que no se convirtieron correctamente.",
+            nombre, tipos_incorrectos,
+        )
+    else:
+        logger.info("%s: Todos los tipos de datos son correctos.", nombre)
+
+    resultado["_tipos_incorrectos_total"] = tipos_incorrectos
     return resultado
 
 
@@ -191,31 +277,63 @@ def validar_fechas(df: DataFrame, nombre: str, col_fecha: str = "date") -> dict:
 
 
 def validar_negativos(df: DataFrame, nombre: str,
-                      columnas_conteos: list) -> dict:
+                      columnas_conteos: list,
+                      columnas_criticas_negativos: list = None) -> dict:
     """
     Verifica que no existan valores negativos en columnas de conteos.
 
-    Los valores negativos pueden indicar correcciones, pero deben
-    registrarse para análisis.
+    Los valores negativos pueden indicar correcciones, pero los que aparecen en
+    columnas epidemiológicas principales (new_confirmed, new_deceased,
+    cumulative_confirmed, cumulative_deceased) se consideran críticos porque
+    afectan directamente las agregaciones y el análisis estadístico.
+
+    Parámetros
+    ----------
+    columnas_criticas_negativos : list, opcional
+        Columnas donde los negativos son críticos y deben sumarse a
+        errores_criticos. Si None, se usan las columnas epidemiológicas
+        principales por defecto.
 
     Retorna
     -------
     dict
-        {columna: cantidad_negativos}
+        {columna: {"negativos": int, "es_critico": bool}}
+        "_total_criticos": int con el total de columnas críticas afectadas.
     """
     logger.info("-" * 40)
     logger.info("VALIDACIÓN DE NEGATIVOS: %s", nombre)
 
+    if columnas_criticas_negativos is None:
+        columnas_criticas_negativos = [
+            "new_confirmed", "new_deceased",
+            "cumulative_confirmed", "cumulative_deceased",
+        ]
+
     resultado = {}
+    total_criticos = 0
+
     for col_name in columnas_conteos:
         if col_name not in df.columns:
             continue
         negativos = df.filter(F.col(col_name) < 0).count()
-        resultado[col_name] = negativos
-        if negativos > 0:
-            logger.warning("  %s: %d valores negativos (posibles correcciones).",
-                           col_name, negativos)
+        es_critico = col_name in columnas_criticas_negativos
 
+        resultado[col_name] = {"negativos": negativos, "es_critico": es_critico}
+
+        if negativos > 0:
+            if es_critico:
+                logger.warning(
+                    "  [CRÍTICO] %s: %d valores negativos en columna epidemiológica principal.",
+                    col_name, negativos,
+                )
+                total_criticos += 1
+            else:
+                logger.warning(
+                    "  %s: %d valores negativos (posibles correcciones).",
+                    col_name, negativos,
+                )
+
+    resultado["_total_criticos"] = total_criticos
     return resultado
 
 
@@ -224,20 +342,28 @@ def validar_coherencia_casos_fallecimientos(df: DataFrame, nombre: str) -> dict:
     Verifica la coherencia entre casos confirmados y fallecimientos.
 
     Reglas:
-    - Los fallecimientos no deben exceder los casos confirmados (acumulados).
-    - Los casos acumulados no deberían ser menores que los casos nuevos diarios.
+    - Los fallecimientos acumulados no deben exceder los casos confirmados acumulados.
+      Esta condición indica un error en los datos fuente (no es una corrección válida).
+      Se marca como crítica porque contamina la tasa de letalidad y el ANOVA.
+    - Los casos acumulados no deberían ser menores que los casos nuevos diarios
+      (inconsistencia lógica: el acumulado es siempre >= al valor de un día).
 
     Retorna
     -------
     dict
-        {inconsistencias_fallecimientos_mayor_casos, inconsistencias_acumulado_menor_nuevo}
+        {
+            "fallecimientos_mayor_casos": int,
+            "acumulado_menor_nuevo": int,
+            "inconsistencias": int,
+            "hay_inconsistencia_critica": bool,
+        }
     """
     logger.info("-" * 40)
     logger.info("VALIDACIÓN DE COHERENCIA: %s", nombre)
 
-    resultado = {"inconsistencias": 0}
+    resultado = {"inconsistencias": 0, "hay_inconsistencia_critica": False}
 
-    # Verificar: fallecimientos > casos confirmados (acumulados)
+    # Verificar: fallecimientos acumulados > casos confirmados acumulados
     if all(c in df.columns for c in ["cumulative_deceased", "cumulative_confirmed"]):
         inconsist = df.filter(
             (F.col("cumulative_deceased") > F.col("cumulative_confirmed")) &
@@ -247,9 +373,14 @@ def validar_coherencia_casos_fallecimientos(df: DataFrame, nombre: str) -> dict:
         ).count()
         resultado["fallecimientos_mayor_casos"] = inconsist
         if inconsist > 0:
-            logger.warning("  Fallecimientos acumulados > casos acumulados: %d registros.", inconsist)
+            logger.warning(
+                "  [CRÍTICO] Fallecimientos acumulados > casos acumulados: %d registros. "
+                "Estos registros contienen una inconsistencia lógica grave.",
+                inconsist,
+            )
+            resultado["hay_inconsistencia_critica"] = True
 
-    # Verificar: acumulado < suma de nuevos (inconsistencia lógica)
+    # Verificar: acumulado < nuevo diario (inconsistencia lógica)
     if all(c in df.columns for c in ["new_confirmed", "cumulative_confirmed"]):
         inconsist = df.filter(
             (F.col("cumulative_confirmed") < F.col("new_confirmed")) &
@@ -262,11 +393,138 @@ def validar_coherencia_casos_fallecimientos(df: DataFrame, nombre: str) -> dict:
         if inconsist > 0:
             logger.warning("  Acumulado < nuevo diario: %d registros.", inconsist)
 
-    total_inconsist = sum(v for v in resultado.values() if isinstance(v, int))
+    total_inconsist = sum(
+        v for k, v in resultado.items()
+        if isinstance(v, int) and k not in ("inconsistencias",)
+    )
     resultado["inconsistencias"] = total_inconsist
 
     if total_inconsist == 0:
         logger.info("  Sin inconsistencias detectadas.")
+
+    return resultado
+
+
+def validar_cumulativo_vs_suma(df: DataFrame, nombre: str,
+                               col_clave: str = "location_key",
+                               col_fecha: str = "date",
+                               col_nuevo: str = "new_confirmed",
+                               col_acumulado: str = "cumulative_confirmed",
+                               cols_particion: list = None) -> dict:
+    """
+    Verifica que el acumulado en cada fecha sea coherente con la suma
+    de los valores nuevos diarios desde el inicio de la serie.
+
+    Un acumulado que difiere en más de 1 unidad respecto a la suma ventana
+    indica que la serie tiene reinicios, correcciones no reflejadas o huecos
+    de reporte. Esto afecta directamente a calcular_tasa_contagio_por_pais,
+    que usa F.max("cumulative_confirmed") como total de casos del país.
+
+    La tolerancia de 1 unidad absorbe diferencias de redondeo o de la fecha
+    de inicio del acumulado cuando los datos arrancan con un valor previo.
+
+    Parámetros
+    ----------
+    df : DataFrame
+    nombre : str
+        Nombre del dataset para el reporte.
+    col_clave : str
+        Columna principal que identifica la ubicación.  Se incluye siempre
+        en la partición de la ventana.
+    col_fecha : str
+        Columna de fecha (para ordenar la ventana).
+    col_nuevo : str
+        Columna de valores nuevos diarios (ej: new_confirmed).
+    col_acumulado : str
+        Columna de valores acumulados (ej: cumulative_confirmed).
+    cols_particion : list, opcional
+        Columnas adicionales que deben incluirse en la partición de la ventana
+        además de ``col_clave``.  Necesario para datasets cuya clave compuesta
+        tenga más de una dimensión, como by-age (location_key + age_bucket):
+        sin ``age_bucket`` en la partición, la ventana acumula todos los grupos
+        etarios de un país juntos y la comparación contra el acumulado por grupo
+        resulta incorrecta.  Por defecto None (solo col_clave).
+
+    Retorna
+    -------
+    dict
+        {
+            col_par: str,          # par de columnas evaluado
+            inconsistencias: int,  # registros donde |acumulado - suma_ventana| > 1
+            total_evaluados: int,  # registros con ambas columnas no nulas
+            omitida: bool,
+        }
+    """
+    logger.info("-" * 40)
+    logger.info("VALIDACIÓN ACUMULADO VS SUMA DIARIOS: %s (%s ~ %s)",
+                nombre, col_acumulado, col_nuevo)
+
+    cols_requeridas = [col_clave, col_fecha, col_nuevo, col_acumulado]
+    if not all(c in df.columns for c in cols_requeridas):
+        faltantes = [c for c in cols_requeridas if c not in df.columns]
+        logger.warning("  Columnas faltantes: %s. Se omite la validación.", faltantes)
+        return {"col_par": f"{col_acumulado}~{col_nuevo}", "inconsistencias": None,
+                "total_evaluados": None, "omitida": True}
+
+    # Construir la lista de columnas de partición.
+    # Siempre incluye col_clave; cols_particion añade dimensiones extra (ej: age_bucket).
+    particion = [col_clave]
+    if cols_particion:
+        for c in cols_particion:
+            if c not in particion and c in df.columns:
+                particion.append(c)
+            elif c not in df.columns:
+                logger.warning(
+                    "  Columna de partición extra '%s' no existe en el DataFrame '%s'. "
+                    "Se ignora.",
+                    c, nombre,
+                )
+
+    logger.info("  Partición de ventana: %s", particion)
+
+    # Ventana particionada por las columnas de clave y ordenada por fecha.
+    # Acumula col_nuevo desde la primera fila hasta la actual inclusive.
+    w = (
+        Window
+        .partitionBy(*particion)
+        .orderBy(col_fecha)
+        .rowsBetween(Window.unboundedPreceding, Window.currentRow)
+    )
+
+    df_eval = (
+        df
+        .filter(
+            F.col(col_nuevo).isNotNull() &
+            F.col(col_acumulado).isNotNull() &
+            (F.col(col_nuevo) >= 0) &        # ignorar correcciones negativas
+            (F.col(col_acumulado) >= 0)
+        )
+        .withColumn("_suma_ventana", F.sum(F.col(col_nuevo)).over(w))
+        .withColumn("_diferencia", F.abs(F.col(col_acumulado) - F.col("_suma_ventana")))
+    )
+
+    total_evaluados = df_eval.count()
+    inconsistencias = df_eval.filter(F.col("_diferencia") > 1).count()
+
+    resultado = {
+        "col_par": f"{col_acumulado}~{col_nuevo}",
+        "inconsistencias": inconsistencias,
+        "total_evaluados": total_evaluados,
+        "omitida": False,
+    }
+
+    if total_evaluados == 0:
+        logger.warning("  No hay registros válidos para evaluar el acumulado.")
+    elif inconsistencias > 0:
+        pct = inconsistencias / total_evaluados * 100
+        logger.warning(
+            "  %d registros (%.1f%%) con |%s - suma(%s)| > 1. "
+            "La serie puede tener reinicios o correcciones no reflejadas en el acumulado. "
+            "F.max('%s') como total de casos puede ser inexacto.",
+            inconsistencias, pct, col_acumulado, col_nuevo, col_acumulado,
+        )
+    else:
+        logger.info("  Acumulado consistente con la suma de diarios. ✓")
 
     return resultado
 
@@ -348,7 +606,46 @@ def generar_reporte_calidad(df: DataFrame, nombre: str,
         reporte["negativos"] = validar_negativos(df, nombre, columnas_conteos)
         reporte["coherencia"] = validar_coherencia_casos_fallecimientos(df, nombre)
 
+    # Validar que el acumulado de casos sea consistente con la suma de nuevos diarios.
+    # Solo tiene sentido cuando el dataset tiene fecha, location_key y ambas columnas
+    # de epidemiología (new_confirmed + cumulative_confirmed).
+    # Para by-age, la clave compuesta incluye age_bucket; sin él la ventana de suma
+    # acumularía todos los grupos etarios de un país juntos y la comparación sería
+    # incorrecta. Se detecta automáticamente si age_bucket está en el DataFrame.
+    if (col_fecha and col_fecha in df.columns and
+            "new_confirmed" in df.columns and "cumulative_confirmed" in df.columns):
+        cols_particion_extra = ["age_bucket"] if "age_bucket" in df.columns else None
+        reporte["cumulativo_vs_suma"] = validar_cumulativo_vs_suma(
+            df, nombre,
+            col_clave=col_clave,
+            col_fecha=col_fecha,
+            col_nuevo="new_confirmed",
+            col_acumulado="cumulative_confirmed",
+            cols_particion=cols_particion_extra,
+        )
+
     reporte["claves"] = validar_integridad_claves(df, nombre, col_clave)
+
+    # Detectar columnas _cast_failed_* creadas por convertir_tipos()
+    # Cada flag marca filas donde un cast produjo nulos nuevos; son errores
+    # de conversión que pueden vaciar columnas clave para el ANOVA.
+    logger.info("-" * 40)
+    logger.info("VALIDACIÓN DE CAST FAILURES: %s", nombre)
+    cast_failures = {}
+    for col_name in df.columns:
+        if col_name.startswith("_cast_failed_"):
+            col_original = col_name[len("_cast_failed_"):]
+            filas_fallidas = df.filter(F.col(col_name) == True).count()  # noqa: E712
+            cast_failures[col_original] = filas_fallidas
+            if filas_fallidas > 0:
+                logger.warning(
+                    "  [CAST FALLIDO] '%s': %d filas no se pudieron convertir al tipo esperado "
+                    "y quedaron como nulos.",
+                    col_original, filas_fallidas,
+                )
+            else:
+                logger.info("  '%s': sin cast failures.", col_original)
+    reporte["cast_failures"] = cast_failures
 
     # Determinar si hay errores críticos
     errores_criticos = 0
@@ -368,6 +665,80 @@ def generar_reporte_calidad(df: DataFrame, nombre: str,
                      max(reporte["duplicados"]["total"], 1) * 100)
         if pct_nulos > 50:
             errores_criticos += 1
+
+    # Tipos de datos incorrectos (columnas que quedaron como StringType en vez
+    # del tipo numérico esperado después del cast).
+    # Se suma 1 único punto al contador, no uno por columna: el número de
+    # columnas afectadas ya queda registrado en el log. Sumar tipos_incorrectos
+    # directamente causaba que el mismo problema se contara dos veces (aquí y
+    # más abajo en cast_failures), ya que un cast fallido siempre produce a su
+    # vez un tipo incorrecto en el schema.
+    tipos_incorrectos = reporte["tipos"].get("_tipos_incorrectos_total", 0)
+    if tipos_incorrectos > 0:
+        logger.warning(
+            "%s: %d columna(s) con tipo de dato incorrecto — se suma 1 a errores críticos.",
+            nombre, tipos_incorrectos,
+        )
+        errores_criticos += 1
+
+    # Negativos en columnas epidemiológicas principales
+    if columnas_conteos:
+        total_neg_criticos = reporte["negativos"].get("_total_criticos", 0)
+        if total_neg_criticos > 0:
+            logger.warning(
+                "%s: %d columna(s) con valores negativos en columnas críticas — "
+                "se suma a errores críticos.",
+                nombre, total_neg_criticos,
+            )
+            errores_criticos += total_neg_criticos
+
+    # Coherencia lógica: fallecimientos acumulados > casos confirmados
+    if columnas_conteos and reporte.get("coherencia", {}).get("hay_inconsistencia_critica"):
+        logger.warning(
+            "%s: fallecimientos acumulados > casos confirmados — "
+            "se suma a errores críticos.",
+            nombre,
+        )
+        errores_criticos += 1
+
+    # Acumulado vs suma de diarios: si más del 5 % de los registros evaluados
+    # muestran |cumulative_confirmed - suma_rolling(new_confirmed)| > 1, la serie
+    # tiene reinicios o correcciones que harían incorrectos los totales del ANOVA.
+    # Umbral del 5 %: tolera días aislados de ajuste sin bloquear el pipeline,
+    # pero detiene el análisis cuando los reinicios son sistemáticos.
+    reporte_cum = reporte.get("cumulativo_vs_suma", {})
+    if (not reporte_cum.get("omitida", True) and
+            reporte_cum.get("total_evaluados") and
+            reporte_cum["total_evaluados"] > 0 and
+            reporte_cum.get("inconsistencias") is not None):
+        pct_inconsistencias = reporte_cum["inconsistencias"] / reporte_cum["total_evaluados"]
+        if pct_inconsistencias > 0.05:
+            logger.warning(
+                "%s: %.1f%% de registros con acumulado inconsistente respecto a la suma de "
+                "diarios (%d de %d). La serie tiene reinicios o correcciones sistemáticas "
+                "que comprometen los totales del análisis estadístico — "
+                "se suma a errores críticos.",
+                nombre,
+                pct_inconsistencias * 100,
+                reporte_cum["inconsistencias"],
+                reporte_cum["total_evaluados"],
+            )
+            errores_criticos += 1
+
+    # Cast failures en columnas de conteo (cast fallido = columna clave queda nula).
+    # Solo se suman si tipos_incorrectos fue 0, para evitar doble conteo:
+    # un cast fallido siempre produce a su vez un tipo incorrecto en el schema,
+    # que ya fue contado en el bloque anterior. Si tipos_incorrectos > 0 el
+    # pipeline ya está marcado como CRÍTICO por ese motivo.
+    if tipos_incorrectos == 0:
+        hay_cast_failure = any(v > 0 for v in cast_failures.values())
+        if hay_cast_failure:
+            errores_criticos += 1
+            logger.warning(
+                "%s: cast failures detectados en columnas de conteo — "
+                "se suma 1 a errores críticos.",
+                nombre,
+            )
 
     reporte["errores_criticos"] = errores_criticos
     reporte["estado"] = "CRÍTICO" if errores_criticos > 0 else "ACEPTABLE"
@@ -410,6 +781,15 @@ def validar_todos_los_datasets(resultados_etl: dict) -> dict:
             columnas_conteos=["new_confirmed", "new_deceased", "cumulative_confirmed", "cumulative_deceased"],
             columnas_clave=["date", "location_key"],
         )
+        # Validar también el par de fallecidos (new_deceased ~ cumulative_deceased)
+        reportes["epidemiologia"]["cumulativo_vs_suma_deceased"] = validar_cumulativo_vs_suma(
+            resultados_etl["df_epidemiologia"],
+            nombre="epidemiologia",
+            col_clave="location_key",
+            col_fecha="date",
+            col_nuevo="new_deceased",
+            col_acumulado="cumulative_deceased",
+        )
 
     # By-age
     if "df_by_age" in resultados_etl and resultados_etl["df_by_age"] is not None:
@@ -419,6 +799,16 @@ def validar_todos_los_datasets(resultados_etl: dict) -> dict:
             columnas_criticas=["date", "location_key", "age_bucket"],
             columnas_conteos=["new_confirmed", "new_deceased", "cumulative_confirmed"],
             columnas_clave=["date", "location_key", "age_bucket"],
+        )
+        # Validar el par de fallecidos con la partición correcta (location_key + age_bucket)
+        reportes["by_age"]["cumulativo_vs_suma_deceased"] = validar_cumulativo_vs_suma(
+            resultados_etl["df_by_age"],
+            nombre="by_age",
+            col_clave="location_key",
+            col_fecha="date",
+            col_nuevo="new_deceased",
+            col_acumulado="cumulative_deceased",
+            cols_particion=["age_bucket"],
         )
 
     # Demographics

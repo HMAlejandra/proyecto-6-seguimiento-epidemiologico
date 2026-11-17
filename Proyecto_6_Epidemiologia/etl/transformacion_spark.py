@@ -37,6 +37,7 @@ from pyspark.sql.types import (
     DateType,
     StringType,
 )
+from pyspark.sql.window import Window
 
 from etl.spark_config import get_spark_session
 from etl.extraccion import RAW_GOOGLE_DIR
@@ -164,7 +165,32 @@ def convertir_tipos(df: DataFrame, columnas_tipo: dict) -> DataFrame:
 
     Retorna
     -------
-    DataFrame con las columnas convertidas.
+    DataFrame con las columnas convertidas y columnas flag
+    ``_cast_failed_<col>`` (booleanas) para cada columna numérica donde al
+    menos una fila no pudo convertirse.
+
+    Optimización de rendimiento
+    ---------------------------
+    La versión anterior ejecutaba dos ``df.filter(...).count()`` por cada
+    columna numérica para medir nulos antes/después del cast.  Sobre un
+    DataFrame con 8 columnas eso generaba 16 jobs Spark adicionales, cada uno
+    releyendo el CSV completo desde disco (el DF no estaba cacheado).
+
+    La versión actual reemplaza esos ``count()`` por columnas derivadas
+    calculadas dentro del plan lógico de Spark:
+
+    1. Se guarda ``_orig_<col>`` (valor original como string).
+    2. Se castea la columna al tipo destino.
+    3. Se añade ``_cast_failed_<col>`` = ``_orig.isNotNull() & col.isNull()``.
+       Esta expresión es True exactamente en las filas que tenían un valor no
+       nulo antes del cast y quedaron nulas después, es decir las que fallaron.
+    4. Se elimina ``_orig_<col>``.
+
+    La detección de cast failures queda embebida en el plan lógico y se evalúa
+    en un único job junto al resto de transformaciones, sin ``count()`` extra.
+    El número de filas fallidas se reporta sólo si ``generar_reporte_calidad``
+    detecta la columna flag; ese conteo se hace una única vez sobre el DF ya
+    transformado y cacheado.
     """
     tipo_map = {
         "long": LongType(),
@@ -181,14 +207,49 @@ def convertir_tipos(df: DataFrame, columnas_tipo: dict) -> DataFrame:
             # Convertir string a fecha
             df = df.withColumn(col_name, F.to_date(F.col(col_name), "yyyy-MM-dd"))
         elif tipo_str in tipo_map:
+            # 1. Guardar la columna original (string) ANTES del cast.
+            orig_col = f"_orig_{col_name}"
+            df = df.withColumn(orig_col, F.col(col_name))
+
+            # 2. Castear al tipo destino.
             df = df.withColumn(col_name, F.col(col_name).cast(tipo_map[tipo_str]))
+
+            # 3. Añadir columna flag para identificar filas donde el cast falló.
+            #    La expresión es True sólo cuando:
+            #      - el valor original era no-nulo (había algo que convertir), Y
+            #      - el valor casteado es nulo (la conversión falló).
+            #    Esto distingue "nulo de origen" (orig nulo → ambos nulos, flag=False)
+            #    de "nulo por cast fallido" (orig no-nulo → casteado nulo, flag=True).
+            #    No se usa count() aquí; el flag se evalúa lazily dentro del plan.
+            flag_col = f"_cast_failed_{col_name}"
+            df = df.withColumn(
+                flag_col,
+                F.col(orig_col).isNotNull() & F.col(col_name).isNull()
+            )
+
+            logger.info(
+                "Cast de '%s' a %s programado. Flag '%s' añadida para detectar "
+                "filas no convertibles (se evalúa lazily, sin count() extra).",
+                col_name, tipo_str, flag_col,
+            )
+
+            # 4. Eliminar la columna temporal original.
+            df = df.drop(orig_col)
 
     return df
 
 
-def eliminar_duplicados(df: DataFrame, subset: list = None) -> DataFrame:
+def eliminar_duplicados(df: DataFrame, subset: list = None,
+                       orden_por: str = None,
+                       contar_eliminados: bool = False) -> DataFrame:
     """
     Elimina filas duplicadas, conservando la primera ocurrencia.
+
+    Usa una ventana con row_number() para garantizar que la fila conservada
+    sea determinista. Si se especifica orden_por, se conserva la fila con el
+    valor más alto en esa columna (útil para quedarse con el registro más
+    completo). Si no se especifica, se conserva la primera fila encontrada
+    por el orden natural de las columnas del subset.
 
     Parámetros
     ----------
@@ -196,19 +257,46 @@ def eliminar_duplicados(df: DataFrame, subset: list = None) -> DataFrame:
     subset : list, opcional
         Columnas a considerar para identificar duplicados.
         Si None, usa todas las columnas.
+    orden_por : str, opcional
+        Nombre de columna para ordenar descendente al desempatar.
+        Si None, usa el orden natural de Spark.
+    contar_eliminados : bool, opcional
+        Si True, ejecuta df.count() antes y después de deduplicar para
+        loggear cuántos duplicados se eliminaron. Por defecto False.
+        ADVERTENCIA: sobre DataFrames grandes (>10 M filas) cada count()
+        desencadena un job Spark completo; actívalo solo cuando el diagnóstico
+        lo justifique.
 
     Retorna
     -------
     DataFrame sin duplicados.
     """
-    total_antes = df.count()
-    df_limpio = df.dropDuplicates(subset)
-    total_despues = df_limpio.count()
-    eliminados = total_antes - total_despues
-    if eliminados > 0:
-        logger.info("Duplicados eliminados: %d (de %d a %d)", eliminados, total_antes, total_despues)
+    if contar_eliminados:
+        total_antes = df.count()
+
+    if subset is None:
+        df_limpio = df.dropDuplicates()
+    elif orden_por is not None and orden_por in df.columns:
+        # Usar ventana para conservar la fila con el valor más alto en orden_por
+        w = Window.partitionBy(*subset).orderBy(F.desc_nulls_last(F.col(orden_por)))
+        df_limpio = (
+            df.withColumn("_row_num", F.row_number().over(w))
+            .filter(F.col("_row_num") == 1)
+            .drop("_row_num")
+        )
     else:
-        logger.info("No se encontraron duplicados.")
+        df_limpio = df.dropDuplicates(subset)
+
+    if contar_eliminados:
+        total_despues = df_limpio.count()
+        eliminados = total_antes - total_despues
+        if eliminados > 0:
+            logger.info("Duplicados eliminados: %d (de %d a %d)", eliminados, total_antes, total_despues)
+        else:
+            logger.info("No se encontraron duplicados.")
+    else:
+        logger.info("Deduplicación completada (contar_eliminados=False — sin count() adicionales).")
+
     return df_limpio
 
 
@@ -262,6 +350,95 @@ def filtrar_colombia(df: DataFrame, col_location: str = "location_key") -> DataF
     total = df_col.count()
     logger.info("Registros de Colombia: %d", total)
     return df_col
+
+
+def filtrar_nivel_geografico(df: DataFrame, nivel: str = "pais",
+                             col_location: str = "location_key") -> DataFrame:
+    """
+    Filtra el DataFrame para conservar un único nivel de granularidad geográfica.
+
+    Los datos de Google Cloud Platform COVID-19 Open Data v3 contienen filas a
+    múltiples niveles jerárquicos para el mismo país:
+        - Nivel país:     location_key = "CO"           (sin guion bajo)
+        - Nivel subregión: location_key = "CO_25"        (un guion bajo)
+        - Nivel municipio: location_key = "CO_25_001"    (dos guiones bajos)
+
+    Si no se filtra, las agregaciones que agrupan por país o fecha producen
+    doble y triple conteo, porque suman las filas de país + subregiones + municipios.
+
+    Parámetros
+    ----------
+    df : DataFrame
+    nivel : str
+        Nivel de granularidad a conservar: "pais", "subregion" o "municipio".
+    col_location : str
+        Nombre de la columna de ubicación.
+
+    Retorna
+    -------
+    DataFrame filtrado a un solo nivel de granularidad.
+    """
+    if col_location not in df.columns:
+        logger.warning("Columna '%s' no encontrada. No se puede filtrar por nivel.", col_location)
+        return df
+
+    # Contar guiones bajos en el location_key para determinar el nivel
+    # location_key sin guion bajo = país (ej: "CO")
+    # location_key con un guion bajo = subregión (ej: "CO_25")
+    # location_key con dos guiones bajos = municipio (ej: "CO_25_001")
+    num_guiones = F.size(F.split(F.col(col_location), "_")) - 1
+
+    if nivel == "pais":
+        df_filtrado = df.filter(num_guiones == 0)
+    elif nivel == "subregion":
+        df_filtrado = df.filter(num_guiones == 1)
+    elif nivel == "municipio":
+        df_filtrado = df.filter(num_guiones == 2)
+    else:
+        logger.warning("Nivel '%s' no reconocido. Opciones: pais, subregion, municipio.", nivel)
+        return df
+
+    total = df_filtrado.count()
+    logger.info("Filtrado a nivel '%s': %d registros.", nivel, total)
+    return df_filtrado
+
+
+# ---------------------------------------------------------------------------
+# Normalización de etiquetas de grupos etarios
+# ---------------------------------------------------------------------------
+
+# Mapa de variantes conocidas del grupo "80+" que GCP ha usado en distintos dumps
+# hacia una etiqueta canónica única. Todas las demás etiquetas se conservan tal cual.
+_AGE_BUCKET_NORMALIZACION = {
+    "80-":    "80+",
+    "80-89":  "80+",
+    "80-99":  "80+",
+    "90+":    "80+",
+    "90-":    "80+",
+    "90-99":  "80+",
+    "100+":   "80+",
+}
+
+# Expresión Spark que aplica el mapa de normalización en una sola pasada.
+# Se construye como CASE WHEN ... ELSE age_bucket END para evitar N withColumn()
+# encadenados (uno por variante).
+def _expr_normalizar_age_bucket(col_name: str = "age_bucket"):
+    """
+    Construye una expresión Spark que reemplaza variantes del grupo '80+'
+    por la etiqueta canónica '80+'. El resto de etiquetas no se modifican.
+
+    Se usa F.when().when()...otherwise() en lugar de una UDF para mantenerse
+    dentro de la API Spark pura (más eficiente, compatible con optimizer).
+    """
+    expr = None
+    for variante, canonica in _AGE_BUCKET_NORMALIZACION.items():
+        condicion = F.col(col_name) == F.lit(variante)
+        if expr is None:
+            expr = F.when(condicion, F.lit(canonica))
+        else:
+            expr = expr.when(condicion, F.lit(canonica))
+    # Para cualquier etiqueta no listada en el mapa, conservar el valor original
+    return expr.otherwise(F.col(col_name)) if expr is not None else F.col(col_name)
 
 
 # ---------------------------------------------------------------------------
@@ -320,7 +497,8 @@ def transformar_by_age(spark) -> Optional[DataFrame]:
     que múltiples uniones).
 
     Produce un DataFrame con columnas:
-    date, location_key, age_bucket, new_confirmed, new_deceased.
+    date, location_key, age_bucket, new_confirmed, new_deceased,
+    cumulative_confirmed, cumulative_deceased.
 
     Los age_bin_X contienen las etiquetas reales: "0-9", "10-19", ..., "90-".
 
@@ -344,6 +522,8 @@ def transformar_by_age(spark) -> Optional[DataFrame]:
         cols_needed.append(f"age_bin_{i}")
         cols_needed.append(f"new_confirmed_age_{i}")
         cols_needed.append(f"new_deceased_age_{i}")
+        cols_needed.append(f"cumulative_confirmed_age_{i}")
+        cols_needed.append(f"cumulative_deceased_age_{i}")
 
     # Leer el CSV y seleccionar solo las columnas que existen
     df_all = (
@@ -360,23 +540,36 @@ def transformar_by_age(spark) -> Optional[DataFrame]:
     # Convertir date a tipo fecha
     df = df.withColumn("date", F.to_date(F.col("date"), "yyyy-MM-dd"))
 
-    # Construir la expresión stack para unpivot en una sola pasada
-    # stack(n, col1_1, col1_2, col1_3, col2_1, col2_2, col2_3, ...)
-    # produce n filas con 3 columnas cada una
+    # Construir la expresión stack para unpivot en una sola pasada.
+    # stack(n, col1_1, col1_2, ...) produce n filas con 5 columnas cada una:
+    # age_bucket, new_confirmed, new_deceased, cumulative_confirmed, cumulative_deceased.
+    #
+    # CORRECCIÓN: las columnas opcionales que no existen en el CSV se añaden al
+    # DataFrame como columnas nulas explícitas (F.lit(None).cast("string")) antes
+    # de construir la vista temporal. De esta forma, la expresión stack siempre
+    # referencia nombres de columnas reales y nunca inyecta SQL literal como
+    # "CAST(NULL AS STRING)", que se interpretaría como nombre de columna y
+    # produciría un error de análisis o un resultado incorrecto.
+    NULL_STR = F.lit(None).cast("string")
+    for i in range(10):
+        for col_opcional in [f"new_deceased_age_{i}",
+                             f"cumulative_confirmed_age_{i}",
+                             f"cumulative_deceased_age_{i}"]:
+            if col_opcional not in df.columns:
+                df = df.withColumn(col_opcional, NULL_STR)
+                logger.debug("Columna '%s' ausente en by-age.csv — añadida como NULL.", col_opcional)
+
     stack_args = []
     for i in range(10):
         age_bin = f"age_bin_{i}"
         new_conf = f"new_confirmed_age_{i}"
         new_dec = f"new_deceased_age_{i}"
+        cum_conf = f"cumulative_confirmed_age_{i}"
+        cum_dec = f"cumulative_deceased_age_{i}"
         if age_bin in df.columns and new_conf in df.columns:
-            stack_args.append(age_bin)
-            stack_args.append(new_conf)
-            if new_dec in df.columns:
-                stack_args.append(new_dec)
-            else:
-                stack_args.append(f"NULL as {new_dec}")
+            stack_args.extend([age_bin, new_conf, new_dec, cum_conf, cum_dec])
 
-    num_cols_per_group = 3  # age_bucket, new_confirmed, new_deceased
+    num_cols_per_group = 5  # age_bucket, new_confirmed, new_deceased, cumulative_confirmed, cumulative_deceased
     num_groups = len(stack_args) // num_cols_per_group
 
     # Crear vista temporal y usar SQL stack
@@ -387,7 +580,7 @@ def transformar_by_age(spark) -> Optional[DataFrame]:
         SELECT 
             date, 
             location_key, 
-            stack({num_groups}, {stack_expr}) AS (age_bucket, new_confirmed, new_deceased)
+            stack({num_groups}, {stack_expr}) AS (age_bucket, new_confirmed, new_deceased, cumulative_confirmed, cumulative_deceased)
         FROM by_age_raw
     """
 
@@ -396,11 +589,30 @@ def transformar_by_age(spark) -> Optional[DataFrame]:
     # Filtrar filas donde age_bucket es nulo
     df_long = df_long.filter(F.col("age_bucket").isNotNull())
 
+    # Normalizar etiquetas del grupo etario superior.
+    # GCP ha usado distintas variantes a lo largo del tiempo para el último
+    # grupo: "80-", "80-89", "80-99", "90+", etc. Sin normalización, el ANOVA
+    # trata cada variante como un grupo distinto, lo que rompe la comparación
+    # entre países y hace que preparar_datos_anova() no encuentre denominador
+    # poblacional para los buckets no listados en BUCKET_A_DEMOGRAPHICS.
+    # La función _expr_normalizar_age_bucket() convierte todas las variantes
+    # a la etiqueta canónica "80+" en una sola pasada, sin UDFs.
+    df_long = df_long.withColumn("age_bucket", _expr_normalizar_age_bucket("age_bucket"))
+    logger.info("Etiquetas de age_bucket normalizadas (variantes '80-x' → '80+').")
+
+    # Convertir columnas numéricas de string a long
+    # (el CSV se leyó con inferSchema=False, así que todas son strings)
+    df_long = df_long.withColumn("new_confirmed", F.col("new_confirmed").cast("long"))
+    df_long = df_long.withColumn("new_deceased", F.col("new_deceased").cast("long"))
+    df_long = df_long.withColumn("cumulative_confirmed", F.col("cumulative_confirmed").cast("long"))
+    df_long = df_long.withColumn("cumulative_deceased", F.col("cumulative_deceased").cast("long"))
+
     # Eliminar duplicados (fecha + ubicación + grupo etario)
     df_long = eliminar_duplicados(df_long, subset=["date", "location_key", "age_bucket"])
 
     # Validar negativos
-    validar_no_negativos(df_long, ["new_confirmed", "new_deceased"])
+    validar_no_negativos(df_long, ["new_confirmed", "new_deceased",
+                                   "cumulative_confirmed", "cumulative_deceased"])
 
     logger.info("Transformacion de by-age completada (WIDE -> LONG con stack): %d filas.", df_long.count())
     return df_long
@@ -604,9 +816,22 @@ def calcular_promedio_casos_por_pais(df_epidemiologia: DataFrame) -> DataFrame:
     """
     logger.info("Calculando promedio de casos nuevos por país...")
 
+    # Filtrar a nivel país para evitar doble conteo
+    df_pais = filtrar_nivel_geografico(df_epidemiologia, nivel="pais")
+
+    # Excluir nulos, negativos y filas sin país identificado.
+    # Los negativos son correcciones contables, no contagios reales; incluirlos
+    # distorsionaría promedios y sumas de forma inconsistente con el ANOVA,
+    # que ya los excluye en preparar_datos_anova().
+    # Los nulos en country_name provienen de location_keys sin coincidencia en
+    # index.csv (left join); se excluyen para no crear un grupo espurio "null".
     agg = (
-        df_epidemiologia
-        .filter(F.col("new_confirmed").isNotNull())
+        df_pais
+        .filter(
+            F.col("new_confirmed").isNotNull() &
+            (F.col("new_confirmed") >= 0) &
+            F.col("country_name").isNotNull()
+        )
         .groupBy("country_name")
         .agg(
             F.avg("new_confirmed").alias("avg_new_confirmed"),
@@ -634,19 +859,33 @@ def calcular_distribucion_por_edad(df_by_age: DataFrame) -> DataFrame:
     """
     logger.info("Calculando distribución de contagios por grupo etario...")
 
+    # Filtrar a nivel país para evitar doble conteo
+    df_pais = filtrar_nivel_geografico(df_by_age, nivel="pais")
+
     agg_cols = []
-    if "new_confirmed" in df_by_age.columns:
+    if "new_confirmed" in df_pais.columns:
         agg_cols.append(F.sum("new_confirmed").alias("total_new_confirmed"))
-    if "new_deceased" in df_by_age.columns:
+    if "new_deceased" in df_pais.columns:
         agg_cols.append(F.sum("new_deceased").alias("total_new_deceased"))
 
-    if "age_bucket" not in df_by_age.columns:
+    if "age_bucket" not in df_pais.columns:
         logger.warning("Columna 'age_bucket' no encontrada en by-age.")
-        return df_by_age
+        return df_pais
+
+    # Excluir negativos antes de agregar.
+    # Los negativos en datos de GCP son correcciones contables, no contagios reales.
+    # Sin este filtro, las sumas por grupo etario quedan subcontadas respecto a
+    # calcular_promedio_casos_por_pais() y calcular_evolucion_temporal(), que sí
+    # los excluyen, generando inconsistencia interna entre las métricas del proyecto.
+    filtros = F.col("age_bucket").isNotNull()
+    if "new_confirmed" in df_pais.columns:
+        filtros = filtros & (F.col("new_confirmed").isNull() | (F.col("new_confirmed") >= 0))
+    if "new_deceased" in df_pais.columns:
+        filtros = filtros & (F.col("new_deceased").isNull() | (F.col("new_deceased") >= 0))
 
     agg = (
-        df_by_age
-        .filter(F.col("age_bucket").isNotNull())
+        df_pais
+        .filter(filtros)
         .groupBy("age_bucket")
         .agg(*agg_cols)
         .orderBy("age_bucket")
@@ -668,17 +907,30 @@ def calcular_evolucion_temporal(df_epidemiologia: DataFrame) -> DataFrame:
     """
     logger.info("Calculando evolución temporal de contagios...")
 
+    # Filtrar a nivel país para evitar doble conteo
+    df_pais = filtrar_nivel_geografico(df_epidemiologia, nivel="pais")
+
     agg_cols = []
-    if "new_confirmed" in df_epidemiologia.columns:
+    if "new_confirmed" in df_pais.columns:
         agg_cols.append(F.sum("new_confirmed").alias("total_new_confirmed"))
-    if "new_deceased" in df_epidemiologia.columns:
+    if "new_deceased" in df_pais.columns:
         agg_cols.append(F.sum("new_deceased").alias("total_new_deceased"))
-    if "cumulative_confirmed" in df_epidemiologia.columns:
+    if "cumulative_confirmed" in df_pais.columns:
         agg_cols.append(F.max("cumulative_confirmed").alias("max_cumulative_confirmed"))
 
+    # Excluir negativos para que la evolución temporal sea coherente con el
+    # filtrado aplicado en el ANOVA (preparar_datos_anova excluye new_confirmed < 0).
+    # Los valores negativos corresponden a correcciones contables; incluirlos
+    # reduciría artificialmente los totales diarios globales.
+    filtros = F.col("date").isNotNull()
+    if "new_confirmed" in df_pais.columns:
+        filtros = filtros & ((F.col("new_confirmed").isNull()) | (F.col("new_confirmed") >= 0))
+    if "new_deceased" in df_pais.columns:
+        filtros = filtros & ((F.col("new_deceased").isNull()) | (F.col("new_deceased") >= 0))
+
     agg = (
-        df_epidemiologia
-        .filter(F.col("date").isNotNull())
+        df_pais
+        .filter(filtros)
         .groupBy("date")
         .agg(*agg_cols)
         .orderBy("date")
@@ -704,33 +956,59 @@ def calcular_tasa_contagio_por_pais(df_epidemiologia: DataFrame,
     """
     logger.info("Calculando tasa de contagio por país...")
 
-    # Agregar casos totales por país
-    agg_cols = []
-    if "cumulative_confirmed" in df_epidemiologia.columns:
-        agg_cols.append(F.max("cumulative_confirmed").alias("total_confirmed"))
-    if "new_confirmed" in df_epidemiologia.columns:
-        agg_cols.append(F.sum("new_confirmed").alias("suma_new_confirmed"))
+    # Filtrar a nivel país para evitar doble conteo
+    df_pais = filtrar_nivel_geografico(df_epidemiologia, nivel="pais")
 
-    if "country_name" not in df_epidemiologia.columns:
+    # Agregar casos totales por país.
+    # Se usa sum(new_confirmed) excluyendo negativos en lugar de
+    # max(cumulative_confirmed), porque los acumulados pueden tener reinicios
+    # o correcciones que hacen que el máximo no represente el total real.
+    # Esto es consistente con el resto de agregaciones del pipeline.
+    agg_cols = []
+    if "new_confirmed" in df_pais.columns:
+        agg_cols.append(
+            F.sum(
+                F.when(F.col("new_confirmed") >= 0, F.col("new_confirmed"))
+            ).alias("total_confirmed")
+        )
+    if "cumulative_confirmed" in df_pais.columns:
+        # Se conserva el acumulado máximo como referencia informativa,
+        # pero NO se usa para calcular la tasa.
+        agg_cols.append(F.max("cumulative_confirmed").alias("max_cumulative_confirmed"))
+
+    if "country_name" not in df_pais.columns:
         logger.warning("Falta country_name en epidemiologia. No se puede calcular tasa por país.")
-        return df_epidemiologia
+        return df_pais
+
+    # Agrupar por country_name y country_code (necesario para el join con demographics)
+    group_cols = ["country_name"]
+    if "country_code" in df_pais.columns:
+        group_cols.append("country_code")
 
     df_agg = (
-        df_epidemiologia
+        df_pais
         .filter(F.col("country_name").isNotNull())
-        .groupBy("country_name")
+        .groupBy(*group_cols)
         .agg(*agg_cols)
     )
 
-    # Integrar con demographics para obtener población por país
-    # Demographics tiene una fila por location_key; para país, location_key = country_code
+    # Integrar con demographics para obtener población por país.
+    # En demographics, la fila a nivel país tiene location_key = country_code (ej: "CO").
+    # Se filtra demographics a nivel país y se une por country_code == location_key.
     if "population" in df_demographics.columns and "location_key" in df_demographics.columns:
-        df_pop = df_demographics.select("location_key", "population").distinct()
-        df_agg = df_agg.join(
-            df_pop,
-            df_agg["country_name"] == df_pop["location_key"],
-            how="left"
-        ).drop(df_pop["location_key"])
+        df_pop = (
+            filtrar_nivel_geografico(df_demographics, nivel="pais")
+            .select("location_key", "population")
+            .distinct()
+        )
+        if "country_code" in df_agg.columns:
+            df_agg = df_agg.join(
+                df_pop,
+                df_agg["country_code"] == df_pop["location_key"],
+                how="left"
+            ).drop(df_pop["location_key"])
+        else:
+            logger.warning("Falta country_code para unir con demographics. La tasa no se puede calcular.")
 
     # Calcular tasa por 100 mil habitantes
     if "total_confirmed" in df_agg.columns and "population" in df_agg.columns:
@@ -782,19 +1060,36 @@ def calcular_relacion_casos_fallecimientos(df_epidemiologia: DataFrame) -> DataF
     """
     logger.info("Calculando relación entre casos nuevos y fallecimientos...")
 
+    # Filtrar a nivel país para evitar doble conteo
+    df_pais = filtrar_nivel_geografico(df_epidemiologia, nivel="pais")
+
     agg_cols = []
-    if "new_confirmed" in df_epidemiologia.columns:
+    if "new_confirmed" in df_pais.columns:
         agg_cols.append(F.sum("new_confirmed").alias("total_new_confirmed"))
-    if "new_deceased" in df_epidemiologia.columns:
+    if "new_deceased" in df_pais.columns:
         agg_cols.append(F.sum("new_deceased").alias("total_new_deceased"))
 
-    if "country_name" not in df_epidemiologia.columns:
+    if "country_name" not in df_pais.columns:
         logger.warning("Falta country_name. No se puede calcular relación por país.")
-        return df_epidemiologia
+        return df_pais
+
+    # Excluir negativos en ambas columnas para que la tasa de letalidad
+    # no se distorsione por correcciones contables.
+    # Se permite que new_deceased sea nulo (no todos los países reportan
+    # fallecimientos diarios), pero no negativo.
+    filtros_letal = F.col("country_name").isNotNull()
+    if "new_confirmed" in df_pais.columns:
+        filtros_letal = filtros_letal & (
+            F.col("new_confirmed").isNull() | (F.col("new_confirmed") >= 0)
+        )
+    if "new_deceased" in df_pais.columns:
+        filtros_letal = filtros_letal & (
+            F.col("new_deceased").isNull() | (F.col("new_deceased") >= 0)
+        )
 
     df_agg = (
-        df_epidemiologia
-        .filter(F.col("country_name").isNotNull())
+        df_pais
+        .filter(filtros_letal)
         .groupBy("country_name")
         .agg(*agg_cols)
     )
@@ -827,26 +1122,30 @@ def calcular_relacion_hospitalizaciones(df_epidemiologia: DataFrame,
     """
     logger.info("Calculando relación entre hospitalizaciones y contagios...")
 
+    # Filtrar a nivel país para evitar doble conteo en ambos datasets
+    df_epi_pais = filtrar_nivel_geografico(df_epidemiologia, nivel="pais")
+    df_hosp_pais = filtrar_nivel_geografico(df_hospitalizaciones, nivel="pais")
+
     # Agregar epidemiología por fecha
-    epi_agg = df_epidemiologia
-    if "new_confirmed" in df_epidemiologia.columns:
+    epi_agg = df_epi_pais
+    if "new_confirmed" in df_epi_pais.columns:
         epi_agg = epi_agg.groupBy("date").agg(
             F.sum("new_confirmed").alias("total_new_confirmed")
         )
     else:
-        return df_epidemiologia
+        return df_epi_pais
 
     # Agregar hospitalizaciones por fecha
     hosp_agg_cols = []
-    if "new_hospitalized_patients" in df_hospitalizaciones.columns:
+    if "new_hospitalized_patients" in df_hosp_pais.columns:
         hosp_agg_cols.append(F.sum("new_hospitalized_patients").alias("total_new_hospitalized"))
-    if "new_intensive_care_patients" in df_hospitalizaciones.columns:
+    if "new_intensive_care_patients" in df_hosp_pais.columns:
         hosp_agg_cols.append(F.sum("new_intensive_care_patients").alias("total_new_intensive_care"))
-    if "current_hospitalized_patients" in df_hospitalizaciones.columns:
+    if "current_hospitalized_patients" in df_hosp_pais.columns:
         hosp_agg_cols.append(F.sum("current_hospitalized_patients").alias("total_current_hospitalized"))
 
     if hosp_agg_cols:
-        hosp_agg = df_hospitalizaciones.groupBy("date").agg(*hosp_agg_cols)
+        hosp_agg = df_hosp_pais.groupBy("date").agg(*hosp_agg_cols)
     else:
         logger.warning("No se encontraron columnas de hospitalizaciones.")
         return epi_agg
@@ -881,18 +1180,21 @@ def calcular_distribucion_edad_sexo(df_by_age: DataFrame) -> DataFrame:
     """
     logger.info("Calculando distribución por edad (sexo no disponible en la fuente)...")
 
-    if "age_bucket" not in df_by_age.columns:
+    # Filtrar a nivel país para evitar doble conteo
+    df_pais = filtrar_nivel_geografico(df_by_age, nivel="pais")
+
+    if "age_bucket" not in df_pais.columns:
         logger.warning("Columna 'age_bucket' no encontrada.")
-        return df_by_age
+        return df_pais
 
     agg_cols = []
-    if "new_confirmed" in df_by_age.columns:
+    if "new_confirmed" in df_pais.columns:
         agg_cols.append(F.sum("new_confirmed").alias("total_new_confirmed"))
-    if "new_deceased" in df_by_age.columns:
+    if "new_deceased" in df_pais.columns:
         agg_cols.append(F.sum("new_deceased").alias("total_new_deceased"))
 
     agg = (
-        df_by_age
+        df_pais
         .filter(F.col("age_bucket").isNotNull())
         .groupBy("age_bucket")
         .agg(*agg_cols)
@@ -921,18 +1223,22 @@ def calcular_relacion_clima_contagios(df_epidemiologia: DataFrame,
     """
     logger.info("Preparando datos de relación clima-contagios...")
 
+    # Filtrar a nivel país para evitar mezclar granularidades
+    df_epi_pais = filtrar_nivel_geografico(df_epidemiologia, nivel="pais")
+    df_weather_pais = filtrar_nivel_geografico(df_weather, nivel="pais")
+
     # Filtrar columnas relevantes
     epi_cols = ["date", "location_key"]
-    if "new_confirmed" in df_epidemiologia.columns:
+    if "new_confirmed" in df_epi_pais.columns:
         epi_cols.append("new_confirmed")
 
     weather_cols = ["date", "location_key"]
     for c in ["average_temperature_celsius", "relative_humidity", "rainfall_mm"]:
-        if c in df_weather.columns:
+        if c in df_weather_pais.columns:
             weather_cols.append(c)
 
-    df_epi_sel = df_epidemiologia.select(*[c for c in epi_cols if c in df_epidemiologia.columns])
-    df_weather_sel = df_weather.select(*[c for c in weather_cols if c in df_weather.columns])
+    df_epi_sel = df_epi_pais.select(*[c for c in epi_cols if c in df_epi_pais.columns])
+    df_weather_sel = df_weather_pais.select(*[c for c in weather_cols if c in df_weather_pais.columns])
 
     df_join = df_epi_sel.join(df_weather_sel, on=["date", "location_key"], how="inner")
 

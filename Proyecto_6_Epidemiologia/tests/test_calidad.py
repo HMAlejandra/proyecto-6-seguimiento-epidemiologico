@@ -19,8 +19,9 @@ from pathlib import Path
 import pytest
 
 os.environ.setdefault('HADOOP_HOME', r'C:\hadoop')
-os.environ.setdefault('PYSPARK_PYTHON', r'C:\Users\helen\AppData\Local\Programs\Python\Python312\python.exe')
-os.environ.setdefault('PYSPARK_DRIVER_PYTHON', r'C:\Users\helen\AppData\Local\Programs\Python\Python312\python.exe')
+# PYSPARK_PYTHON y PYSPARK_DRIVER_PYTHON se configuran en spark_config._configure_spark_env().
+# Para usar Python 3.12 define antes de ejecutar:
+#   $env:PYSPARK_PYTHON_312 = "C:\Users\TU_USUARIO\...\Python312\python.exe"
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
@@ -143,7 +144,8 @@ class TestValidarNegativos:
         df = df.withColumn("new_confirmed", F.col("new_confirmed").cast("long"))
         resultado = validar_negativos(df, "test_neg", ["new_confirmed"])
 
-        assert resultado["new_confirmed"] == 1  # Un valor negativo
+        # validar_negativos() retorna {col: {"negativos": int, "es_critico": bool}}
+        assert resultado["new_confirmed"]["negativos"] == 1
 
     def test_sin_negativos(self, spark, csv_bueno):
         """Verifica que reporte correctamente sin negativos."""
@@ -151,7 +153,7 @@ class TestValidarNegativos:
         df = df.withColumn("new_confirmed", F.col("new_confirmed").cast("long"))
         resultado = validar_negativos(df, "test_sin_neg", ["new_confirmed"])
 
-        assert resultado["new_confirmed"] == 0
+        assert resultado["new_confirmed"]["negativos"] == 0
 
 
 class TestCoherencia:

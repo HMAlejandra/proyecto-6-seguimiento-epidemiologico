@@ -27,12 +27,24 @@ logger = logging.getLogger(__name__)
 
 # Ruta al ejecutable de Python 3.12 (compatible con PySpark 4.0.0).
 # Python 3.14 (versión por defecto del sistema) tiene incompatibilidades con el
-# protocolo de workers de Spark, por lo que usamos Python 3.12 explícitamente.
-PYTHON_312_PATH = r"C:\Users\helen\AppData\Local\Programs\Python\Python312\python.exe"
+# protocolo de workers de Spark, por lo que se recomienda usar Python 3.12.
+#
+# Configura la variable de entorno PYSPARK_PYTHON_312 antes de lanzar el pipeline
+# para hacer el proyecto portable entre máquinas:
+#   $env:PYSPARK_PYTHON_312 = "C:\Users\TU_USUARIO\...\Python312\python.exe"
+#
+# Si la variable no está definida y la ruta por defecto no existe, se usa
+# automáticamente el intérprete activo (sys.executable) como fallback.
+_DEFAULT_PYTHON_312 = r"C:\Python312\python.exe"
+PYTHON_312_PATH = os.environ.get("PYSPARK_PYTHON_312", _DEFAULT_PYTHON_312)
 
 # Ruta a la instalación de Hadoop (winutils.exe) necesaria para operaciones
 # de escritura de Spark en Windows.
-HADOOP_HOME = r"C:\hadoop"
+#
+# Se lee de la variable de entorno HADOOP_HOME si está definida.
+# Si no, se usa C:\hadoop como valor por defecto.
+#   $env:HADOOP_HOME = "C:\hadoop"
+HADOOP_HOME = os.environ.get("HADOOP_HOME", r"C:\hadoop")
 
 
 def _configure_spark_env():
@@ -117,8 +129,11 @@ def get_spark_session(app_name: str = "Proyecto6_Epidemiologia") -> SparkSession
         .config("spark.sql.shuffle.partitions", "8")
         # Permite sobre-escritura de archivos Parquet/CSV ya existentes
         .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
-        # Evita advertencias de deprecación en lectura de CSV con encabezado
-        .config("spark.sql.legacy.timeParserPolicy", "LEGACY")
+        # Parser de fechas estricto: falla ruidosamente ante fechas malformadas
+        # en lugar de enmascarar errores con el modo LEGACY.
+        # Si algún CSV de la fuente tiene fechas en formato no estándar y el
+        # pipeline falla aquí, revisar extraccion.py para limpiar ese campo antes.
+        .config("spark.sql.legacy.timeParserPolicy", "CORRECTED")
         # Ruta del warehouse local de Spark (evita crear spark-warehouse en raíz)
         .config(
             "spark.sql.warehouse.dir",
