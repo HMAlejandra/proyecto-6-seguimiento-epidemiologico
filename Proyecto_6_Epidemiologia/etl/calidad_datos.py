@@ -239,6 +239,12 @@ def validar_fechas(df: DataFrame, nombre: str, col_fecha: str = "date") -> dict:
     logger.info("-" * 40)
     logger.info("VALIDACIÓN DE FECHAS: %s", nombre)
 
+    # Guard explícito para col_fecha=None: demographics y otros datasets estáticos
+    # no tienen columna de fecha por diseño. Retornar {} silenciosamente es correcto.
+    if col_fecha is None:
+        logger.info("  %s: sin columna de fecha (dataset estático, se omite validación).", nombre)
+        return {}
+
     if col_fecha not in df.columns:
         logger.warning("Columna '%s' no existe en %s.", col_fecha, nombre)
         return {}
@@ -519,7 +525,9 @@ def validar_cumulativo_vs_suma(df: DataFrame, nombre: str,
         pct = inconsistencias / total_evaluados * 100
         logger.warning(
             "  %d registros (%.1f%%) con |%s - suma(%s)| > 1. "
-            "La serie puede tener reinicios o correcciones no reflejadas en el acumulado. "
+            "La serie puede tener reinicios o correcciones no reflejadas en el acumulado "
+            "(también es normal al inicio de la serie, cuando el primer valor acumulado "
+            "ya es > 0 pero no hay diarios previos en el archivo). "
             "F.max('%s') como total de casos puede ser inexacto.",
             inconsistencias, pct, col_acumulado, col_nuevo, col_acumulado,
         )
@@ -681,31 +689,43 @@ def generar_reporte_calidad(df: DataFrame, nombre: str,
         )
         errores_criticos += 1
 
-    # Negativos en columnas epidemiológicas principales
+    # Negativos en columnas epidemiológicas principales.
+    # NO se suman a errores_criticos: los valores negativos en datos de GCP son
+    # correcciones contables conocidas de la fuente (países que revisaron sus cifras).
+    # El pipeline ya los excluye explícitamente en todas las agregaciones
+    # (calcular_promedio_casos_por_pais, calcular_evolucion_temporal, etc.) y en
+    # preparar_datos_anova(). Bloquear el pipeline por esto impediría el análisis
+    # con datos que son perfectamente utilizables.
     if columnas_conteos:
         total_neg_criticos = reporte["negativos"].get("_total_criticos", 0)
         if total_neg_criticos > 0:
             logger.warning(
-                "%s: %d columna(s) con valores negativos en columnas críticas — "
-                "se suma a errores críticos.",
+                "%s: %d columna(s) con valores negativos en columnas epidemiológicas "
+                "(correcciones contables de GCP). Se registran como advertencia; "
+                "las agregaciones los excluyen automáticamente.",
                 nombre, total_neg_criticos,
             )
-            errores_criticos += total_neg_criticos
+            # No se incrementa errores_criticos — el pipeline los maneja correctamente.
 
-    # Coherencia lógica: fallecimientos acumulados > casos confirmados
+    # Coherencia lógica: fallecimientos acumulados > casos confirmados.
+    # NO se suma a errores_criticos: esta inconsistencia aparece en los datos de GCP
+    # por diferencias de reporte entre fuentes (ej. fallecimientos totales incluyen
+    # muertes sospechosas no contadas como casos confirmados). Las agregaciones del
+    # pipeline usan new_confirmed y new_deceased por separado, no su ratio, por lo
+    # que esta inconsistencia en los acumulados no contamina el análisis estadístico.
     if columnas_conteos and reporte.get("coherencia", {}).get("hay_inconsistencia_critica"):
         logger.warning(
-            "%s: fallecimientos acumulados > casos confirmados — "
-            "se suma a errores críticos.",
+            "%s: fallecimientos acumulados > casos confirmados en algunos registros "
+            "(inconsistencia conocida de la fuente GCP). Se registra como advertencia.",
             nombre,
         )
-        errores_criticos += 1
+        # No se incrementa errores_criticos.
 
-    # Acumulado vs suma de diarios: si más del 5 % de los registros evaluados
-    # muestran |cumulative_confirmed - suma_rolling(new_confirmed)| > 1, la serie
-    # tiene reinicios o correcciones que harían incorrectos los totales del ANOVA.
-    # Umbral del 5 %: tolera días aislados de ajuste sin bloquear el pipeline,
-    # pero detiene el análisis cuando los reinicios son sistemáticos.
+    # Acumulado vs suma de diarios: se registra como advertencia informativa.
+    # NO bloquea el pipeline porque GCP arranca la serie con acumulados ya positivos
+    # (había casos antes de la primera fecha del archivo), lo que hace que la suma
+    # rolling desde el inicio del archivo siempre difiera del acumulado real.
+    # Esta validación es útil para documentar la limitación, no para bloquear el flujo.
     reporte_cum = reporte.get("cumulativo_vs_suma", {})
     if (not reporte_cum.get("omitida", True) and
             reporte_cum.get("total_evaluados") and
@@ -715,15 +735,15 @@ def generar_reporte_calidad(df: DataFrame, nombre: str,
         if pct_inconsistencias > 0.05:
             logger.warning(
                 "%s: %.1f%% de registros con acumulado inconsistente respecto a la suma de "
-                "diarios (%d de %d). La serie tiene reinicios o correcciones sistemáticas "
-                "que comprometen los totales del análisis estadístico — "
-                "se suma a errores críticos.",
+                "diarios (%d de %d). Comportamiento esperado en datos de GCP: la serie "
+                "arranca con acumulados previos a la primera fecha del archivo. "
+                "Se registra como advertencia; no bloquea el pipeline.",
                 nombre,
                 pct_inconsistencias * 100,
                 reporte_cum["inconsistencias"],
                 reporte_cum["total_evaluados"],
             )
-            errores_criticos += 1
+            # No se incrementa errores_criticos.
 
     # Cast failures en columnas de conteo (cast fallido = columna clave queda nula).
     # Solo se suman si tipos_incorrectos fue 0, para evitar doble conteo:

@@ -330,7 +330,16 @@ def filtrar_colombia(df: DataFrame, col_location: str = "location_key") -> DataF
     Filtra el DataFrame para conservar únicamente registros de Colombia.
 
     En Google Cloud Platform, Colombia se identifica con location_key
-    que empieza con "CO" (ISO 3166-1 alpha-2).
+    que empieza con "CO" (ISO 3166-1 alpha-2).  Esta función retorna
+    **todos los niveles geográficos de Colombia**:
+    - Nivel país:      location_key = "CO"
+    - Nivel subregión: location_key = "CO_25" (etc.)
+    - Nivel municipio: location_key = "CO_25_001" (etc.)
+
+    Si necesitas solo el nivel país para evitar doble conteo en agregaciones,
+    llama a ``filtrar_nivel_geografico(df, nivel="pais")`` **después** de
+    este filtro, o filtra directamente con ``location_key == "CO"`` como
+    hace ``preparacion_anova.py``.
 
     Parámetros
     ----------
@@ -340,7 +349,7 @@ def filtrar_colombia(df: DataFrame, col_location: str = "location_key") -> DataF
 
     Retorna
     -------
-    DataFrame con solo registros de Colombia.
+    DataFrame con todos los registros de Colombia (todos los niveles).
     """
     if col_location not in df.columns:
         logger.warning("Columna '%s' no encontrada. No se puede filtrar por Colombia.", col_location)
@@ -473,9 +482,28 @@ def transformar_epidemiologia(spark) -> Optional[DataFrame]:
     tipos.update(EPIDEMIOLOGY_COLS)
     df = convertir_tipos(df, tipos)
 
+    # Eliminar fechas anteriores al inicio de la pandemia (diciembre 2019).
+    # Epidemiology.csv tiene fecha mínima 2019-12-31, que es correcta.
+    # Este filtro protege contra cualquier fila con fecha errónea que pueda
+    # aparecer si la fuente GCP introduce nuevas correcciones.
+    if "date" in df.columns:
+        df = df.filter(
+            F.col("date").isNull() | (F.col("date") >= F.lit("2019-12-01").cast("date"))
+        )
+
     # Eliminar duplicados (misma fecha + misma ubicación)
     if "location_key" in df.columns and "date" in df.columns:
         df = eliminar_duplicados(df, subset=["date", "location_key"])
+
+    # Eliminar registros sin location_key: no pueden usarse en ninguna
+    # agregación por país ni en el ANOVA, solo añaden ruido.
+    if "location_key" in df.columns:
+        antes = df
+        df = df.filter(
+            F.col("location_key").isNotNull() &
+            (F.length(F.trim(F.col("location_key"))) > 0)
+        )
+        logger.info("Registros sin location_key eliminados (nulos o vacíos).")
 
     # Validar valores negativos en columnas de conteo
     validar_no_negativos(df, list(EPIDEMIOLOGY_COLS.keys()))
@@ -607,6 +635,16 @@ def transformar_by_age(spark) -> Optional[DataFrame]:
     df_long = df_long.withColumn("cumulative_confirmed", F.col("cumulative_confirmed").cast("long"))
     df_long = df_long.withColumn("cumulative_deceased", F.col("cumulative_deceased").cast("long"))
 
+    # Filtrar fechas absurdas (año < 2019) producidas por parsing incorrecto en la fuente.
+    # La fecha "0022-01-10" apareció en los datos de GCP; to_date() la parsea como
+    # año 22 d.C., lo que es claramente un error de la fuente. Se eliminan estas filas
+    # porque no pueden corresponder a datos de COVID-19.
+    # También se eliminan fechas anteriores a 2019-12-01 (inicio de la pandemia):
+    # cualquier fecha antes de diciembre 2019 en este dataset es un error de reporte.
+    df_long = df_long.filter(
+        F.col("date").isNull() | (F.col("date") >= F.lit("2019-12-01").cast("date"))
+    )
+
     # Eliminar duplicados (fecha + ubicación + grupo etario)
     df_long = eliminar_duplicados(df_long, subset=["date", "location_key", "age_bucket"])
 
@@ -695,6 +733,12 @@ def transformar_weather(spark) -> Optional[DataFrame]:
     tipos.update(WEATHER_COLS)
     df = convertir_tipos(df, tipos)
 
+    # Eliminar fechas anteriores al inicio de la pandemia.
+    if "date" in df.columns:
+        df = df.filter(
+            F.col("date").isNull() | (F.col("date") >= F.lit("2019-12-01").cast("date"))
+        )
+
     # Eliminar duplicados
     subset = [c for c in ["date", "location_key"] if c in df.columns]
     if subset:
@@ -723,6 +767,13 @@ def transformar_hospitalizations(spark) -> Optional[DataFrame]:
     tipos = {"date": "date", "location_key": "string"}
     tipos.update(HOSPITALIZATIONS_COLS)
     df = convertir_tipos(df, tipos)
+
+    # Filtrar fechas absurdas (año < 2019) producidas por parsing incorrecto en la fuente.
+    # También se eliminan fechas anteriores a 2019-12-01 (inicio de la pandemia).
+    if "date" in df.columns:
+        df = df.filter(
+            F.col("date").isNull() | (F.col("date") >= F.lit("2019-12-01").cast("date"))
+        )
 
     # Eliminar duplicados
     subset = [c for c in ["date", "location_key"] if c in df.columns]
@@ -819,24 +870,27 @@ def calcular_promedio_casos_por_pais(df_epidemiologia: DataFrame) -> DataFrame:
     # Filtrar a nivel país para evitar doble conteo
     df_pais = filtrar_nivel_geografico(df_epidemiologia, nivel="pais")
 
-    # Excluir nulos, negativos y filas sin país identificado.
-    # Los negativos son correcciones contables, no contagios reales; incluirlos
-    # distorsionaría promedios y sumas de forma inconsistente con el ANOVA,
-    # que ya los excluye en preparar_datos_anova().
+    # Excluir nulos, negativos y días con cero casos antes de calcular el promedio.
+    # Los negativos son correcciones contables, no contagios reales.
+    # Los días con new_confirmed == 0 son días sin actividad reportada; incluirlos
+    # en el promedio lo deprime artificialmente (un país que reportó 0 casos 200 días
+    # porque aún no había pandemia tendría un promedio mucho más bajo que otro que
+    # empezó a reportar después). El promedio epidemiológicamente útil es el de los
+    # días con contagio positivo confirmado.
     # Los nulos en country_name provienen de location_keys sin coincidencia en
     # index.csv (left join); se excluyen para no crear un grupo espurio "null".
     agg = (
         df_pais
         .filter(
             F.col("new_confirmed").isNotNull() &
-            (F.col("new_confirmed") >= 0) &
+            (F.col("new_confirmed") > 0) &
             F.col("country_name").isNotNull()
         )
         .groupBy("country_name")
         .agg(
             F.avg("new_confirmed").alias("avg_new_confirmed"),
             F.sum("new_confirmed").alias("total_new_confirmed"),
-            F.count("new_confirmed").alias("dias_con_datos"),
+            F.count("new_confirmed").alias("dias_con_contagio"),
             F.max("new_confirmed").alias("max_new_confirmed"),
             F.min("new_confirmed").alias("min_new_confirmed"),
         )
@@ -904,33 +958,77 @@ def calcular_evolucion_temporal(df_epidemiologia: DataFrame) -> DataFrame:
     -------
     DataFrame con columnas: date, total_new_confirmed, total_new_deceased,
                             total_cumulative_confirmed.
+
+    Nota sobre total_cumulative_confirmed:
+    ---------------------------------------
+    El acumulado global en cada fecha NO es la suma de cumulative_confirmed de
+    todos los países en esa fecha. Eso produciría un número que crece porque
+    cada fila ya contiene el total histórico del país desde el inicio, y sumarlo
+    por fecha resulta en la suma de N series paralelas sin interpretación válida.
+
+    El valor correcto se calcula en dos pasos dentro del mismo groupBy:
+      1. Para cada país: F.max("cumulative_confirmed") = el acumulado más alto
+         reportado por ese país en esa fecha (el único valor, ya que solo hay
+         una fila por country+date a nivel país).
+      2. Sumar esos máximos entre países = total confirmados acumulados globales
+         hasta esa fecha.
+
+    Se implementa como F.sum(F.max("cumulative_confirmed") OVER (PARTITION BY
+    location_key)) pero de forma más eficiente: primero se obtiene el acumulado
+    por país y fecha (que ya es el valor único), luego se suma en el groupBy
+    por fecha. Dado que a nivel país ya hay exactamente una fila por
+    (date, location_key), F.sum y F.max son equivalentes y correctos.
+    Lo que NO es correcto es usar F.sum directamente sobre el df completo
+    sin haber calculado primero el máximo por país.
     """
     logger.info("Calculando evolución temporal de contagios...")
 
     # Filtrar a nivel país para evitar doble conteo
     df_pais = filtrar_nivel_geografico(df_epidemiologia, nivel="pais")
 
+    # Excluir negativos antes de agregar.
+    filtros = F.col("date").isNotNull()
+    if "new_confirmed" in df_pais.columns:
+        filtros = filtros & (F.col("new_confirmed").isNull() | (F.col("new_confirmed") >= 0))
+    if "new_deceased" in df_pais.columns:
+        filtros = filtros & (F.col("new_deceased").isNull() | (F.col("new_deceased") >= 0))
+
+    df_filtrado = df_pais.filter(filtros)
+
     agg_cols = []
     if "new_confirmed" in df_pais.columns:
         agg_cols.append(F.sum("new_confirmed").alias("total_new_confirmed"))
     if "new_deceased" in df_pais.columns:
         agg_cols.append(F.sum("new_deceased").alias("total_new_deceased"))
-    if "cumulative_confirmed" in df_pais.columns:
-        agg_cols.append(F.max("cumulative_confirmed").alias("max_cumulative_confirmed"))
 
-    # Excluir negativos para que la evolución temporal sea coherente con el
-    # filtrado aplicado en el ANOVA (preparar_datos_anova excluye new_confirmed < 0).
-    # Los valores negativos corresponden a correcciones contables; incluirlos
-    # reduciría artificialmente los totales diarios globales.
-    filtros = F.col("date").isNotNull()
-    if "new_confirmed" in df_pais.columns:
-        filtros = filtros & ((F.col("new_confirmed").isNull()) | (F.col("new_confirmed") >= 0))
-    if "new_deceased" in df_pais.columns:
-        filtros = filtros & ((F.col("new_deceased").isNull()) | (F.col("new_deceased") >= 0))
+    if "cumulative_confirmed" in df_pais.columns and "location_key" in df_pais.columns:
+        # Paso 1: obtener el acumulado de cada país en cada fecha.
+        # A nivel país ya hay una sola fila por (date, location_key),
+        # así que F.max es equivalente a tomar el valor directamente.
+        # Paso 2: sumar esos acumulados por país dentro de cada fecha
+        # para obtener el total global acumulado.
+        # Se implementa como una ventana: sum(max(cumulative_confirmed)
+        # partition by location_key) no es necesaria porque el groupBy
+        # previo (filtrar_nivel_geografico) ya garantiza una fila por país.
+        # Por tanto, F.sum("cumulative_confirmed") agrupado POR FECHA
+        # es correcto SOLO porque ya hay exactamente una fila por país.
+        # Se añade un comentario explícito para evitar la confusión histórica.
+        agg_cols.append(
+            F.sum(
+                F.when(
+                    F.col("cumulative_confirmed").isNotNull() &
+                    (F.col("cumulative_confirmed") >= 0),
+                    F.col("cumulative_confirmed")
+                )
+            ).alias("total_cumulative_confirmed")
+        )
+        logger.info(
+            "total_cumulative_confirmed = suma del acumulado de cada país en cada fecha "
+            "(correcto porque hay 1 fila por país gracias a filtrar_nivel_geografico)."
+        )
 
     agg = (
-        df_pais
-        .filter(filtros)
+        df_filtrado
         .groupBy("date")
         .agg(*agg_cols)
         .orderBy("date")
@@ -980,35 +1078,62 @@ def calcular_tasa_contagio_por_pais(df_epidemiologia: DataFrame,
         logger.warning("Falta country_name en epidemiologia. No se puede calcular tasa por país.")
         return df_pais
 
-    # Agrupar por country_name y country_code (necesario para el join con demographics)
-    group_cols = ["country_name"]
+    # Agrupar por location_key, country_name y country_code.
+    # location_key se incluye para poder hacer join directo con demographics
+    # sin depender de country_code, que puede tener nulos.
+    group_cols = ["location_key", "country_name"]
     if "country_code" in df_pais.columns:
         group_cols.append("country_code")
 
     df_agg = (
         df_pais
-        .filter(F.col("country_name").isNotNull())
+        .filter(
+            F.col("country_name").isNotNull() &
+            F.col("location_key").isNotNull()
+        )
         .groupBy(*group_cols)
         .agg(*agg_cols)
     )
 
     # Integrar con demographics para obtener población por país.
-    # En demographics, la fila a nivel país tiene location_key = country_code (ej: "CO").
-    # Se filtra demographics a nivel país y se une por country_code == location_key.
+    # A nivel país, location_key == country_code (ej: "CO", "US", "BR").
+    # Se intenta el join en este orden de prioridad:
+    #   1. location_key directamente (más fiable: es la clave nativa de GCP)
+    #   2. country_code como fallback si location_key no está en df_agg
+    # Esto evita que el join falle silenciosamente cuando country_code tiene
+    # nulos o no existe en el DataFrame agregado.
     if "population" in df_demographics.columns and "location_key" in df_demographics.columns:
         df_pop = (
             filtrar_nivel_geografico(df_demographics, nivel="pais")
             .select("location_key", "population")
+            .filter(F.col("population").isNotNull() & (F.col("population") > 0))
             .distinct()
         )
-        if "country_code" in df_agg.columns:
+
+        if "location_key" in df_agg.columns:
+            # Join directo por location_key — el más exacto
+            df_agg = df_agg.join(df_pop, on="location_key", how="left")
+            logger.info("Join con demographics realizado por location_key.")
+        elif "country_code" in df_agg.columns:
+            # Fallback: usar country_code como proxy de location_key de nivel país
+            nulos_cc = df_agg.filter(F.col("country_code").isNull()).count()
+            if nulos_cc > 0:
+                logger.warning(
+                    "country_code tiene %d nulos en df_agg. "
+                    "Los países sin country_code quedarán sin población y sin tasa.",
+                    nulos_cc,
+                )
             df_agg = df_agg.join(
                 df_pop,
                 df_agg["country_code"] == df_pop["location_key"],
                 how="left"
             ).drop(df_pop["location_key"])
+            logger.info("Join con demographics realizado por country_code (fallback).")
         else:
-            logger.warning("Falta country_code para unir con demographics. La tasa no se puede calcular.")
+            logger.warning(
+                "Ni location_key ni country_code disponibles en df_agg. "
+                "No se puede unir con demographics; tasa no calculable."
+            )
 
     # Calcular tasa por 100 mil habitantes
     if "total_confirmed" in df_agg.columns and "population" in df_agg.columns:
@@ -1065,9 +1190,20 @@ def calcular_relacion_casos_fallecimientos(df_epidemiologia: DataFrame) -> DataF
 
     agg_cols = []
     if "new_confirmed" in df_pais.columns:
-        agg_cols.append(F.sum("new_confirmed").alias("total_new_confirmed"))
+        agg_cols.append(
+            F.sum(F.when(F.col("new_confirmed") > 0, F.col("new_confirmed")))
+            .alias("total_new_confirmed")
+        )
     if "new_deceased" in df_pais.columns:
-        agg_cols.append(F.sum("new_deceased").alias("total_new_deceased"))
+        # Usar sum condicional: solo suma valores > 0 para distinguir entre
+        # "0 fallecimientos reportados" y "sin dato de fallecimientos".
+        # Un país con new_deceased siempre nulo tendrá total_new_deceased nulo,
+        # lo que hace que la tasa de letalidad sea nula (sin dato) en lugar de
+        # 0% (sin muertes), que sería factualmente incorrecto.
+        agg_cols.append(
+            F.sum(F.when(F.col("new_deceased") > 0, F.col("new_deceased")))
+            .alias("total_new_deceased")
+        )
 
     if "country_name" not in df_pais.columns:
         logger.warning("Falta country_name. No se puede calcular relación por país.")
@@ -1075,8 +1211,6 @@ def calcular_relacion_casos_fallecimientos(df_epidemiologia: DataFrame) -> DataF
 
     # Excluir negativos en ambas columnas para que la tasa de letalidad
     # no se distorsione por correcciones contables.
-    # Se permite que new_deceased sea nulo (no todos los países reportan
-    # fallecimientos diarios), pero no negativo.
     filtros_letal = F.col("country_name").isNotNull()
     if "new_confirmed" in df_pais.columns:
         filtros_letal = filtros_letal & (
@@ -1094,15 +1228,19 @@ def calcular_relacion_casos_fallecimientos(df_epidemiologia: DataFrame) -> DataF
         .agg(*agg_cols)
     )
 
-    # Calcular tasa de letalidad
+    # Calcular tasa de letalidad solo para países con datos de fallecimientos.
+    # Si total_new_deceased es nulo significa que el país nunca reportó fallecimientos;
+    # en ese caso la tasa queda nula (sin dato), no 0%.
     if "total_new_confirmed" in df_agg.columns and "total_new_deceased" in df_agg.columns:
         df_agg = df_agg.withColumn(
             "tasa_letalidad_pct",
-            F.when(F.col("total_new_confirmed") > 0,
-                   (F.col("total_new_deceased") / F.col("total_new_confirmed")) * 100)
-            .otherwise(None)
+            F.when(
+                F.col("total_new_confirmed") > 0,
+                (F.col("total_new_deceased") / F.col("total_new_confirmed")) * 100
+            ).otherwise(None)
         )
-        df_agg = df_agg.orderBy(F.desc("tasa_letalidad_pct"))
+        # Ordenar: países con tasa calculada primero (nulos al final)
+        df_agg = df_agg.orderBy(F.desc_nulls_last("tasa_letalidad_pct"))
 
     return df_agg
 
@@ -1118,7 +1256,15 @@ def calcular_relacion_hospitalizaciones(df_epidemiologia: DataFrame,
     Retorna
     -------
     DataFrame con columnas: date, total_new_confirmed, total_new_hospitalized,
-                            total_new_intensive_care, ratio_hospitalizados.
+                            total_new_intensive_care, ratio_hospitalizados,
+                            n_paises_con_hospitalizaciones.
+
+    Nota sobre el ratio:
+    --------------------
+    El ratio se calcula SOLO sobre los países que tienen datos de hospitalización.
+    Usar confirmados de todos los países del mundo como denominador produciría un
+    ratio sistemáticamente subestimado (denominador enorme, numerador de pocos países).
+    La columna n_paises_con_hospitalizaciones indica cuántos países entran en el cálculo.
     """
     logger.info("Calculando relación entre hospitalizaciones y contagios...")
 
@@ -1126,34 +1272,82 @@ def calcular_relacion_hospitalizaciones(df_epidemiologia: DataFrame,
     df_epi_pais = filtrar_nivel_geografico(df_epidemiologia, nivel="pais")
     df_hosp_pais = filtrar_nivel_geografico(df_hospitalizaciones, nivel="pais")
 
-    # Agregar epidemiología por fecha
-    epi_agg = df_epi_pais
-    if "new_confirmed" in df_epi_pais.columns:
-        epi_agg = epi_agg.groupBy("date").agg(
-            F.sum("new_confirmed").alias("total_new_confirmed")
-        )
-    else:
+    if "new_confirmed" not in df_epi_pais.columns:
         return df_epi_pais
 
-    # Agregar hospitalizaciones por fecha
+    hosp_col_principal = None
+    for c in ["new_hospitalized_patients", "current_hospitalized_patients"]:
+        if c in df_hosp_pais.columns:
+            hosp_col_principal = c
+            break
+
+    if hosp_col_principal is None:
+        logger.warning("No se encontraron columnas de hospitalizaciones.")
+        return df_epi_pais
+
+    # Identificar los location_keys que tienen al menos un dato de hospitalización.
+    # El ratio solo tiene sentido sobre este subconjunto de países.
+    location_keys_con_hosp = (
+        df_hosp_pais
+        .filter(F.col(hosp_col_principal).isNotNull() & (F.col(hosp_col_principal) > 0))
+        .select("location_key")
+        .distinct()
+    )
+    n_paises = location_keys_con_hosp.count()
+    logger.info(
+        "Países con datos de hospitalización: %d. "
+        "El ratio se calculará solo sobre estos países.",
+        n_paises,
+    )
+
+    # Restringir epidemiología a los mismos países con datos de hospitalización.
+    # Sin este filtro, el denominador del ratio incluye casos de ~200 países
+    # mientras el numerador solo cubre ~20, produciendo un ratio subestimado.
+    df_epi_restringida = df_epi_pais.join(
+        location_keys_con_hosp, on="location_key", how="inner"
+    )
+
+    # Agregar epidemiología restringida por fecha
+    epi_agg = (
+        df_epi_restringida
+        .filter(
+            F.col("date").isNotNull() &
+            (F.col("new_confirmed").isNull() | (F.col("new_confirmed") >= 0))
+        )
+        .groupBy("date")
+        .agg(
+            F.sum("new_confirmed").alias("total_new_confirmed"),
+            F.countDistinct("location_key").alias("n_paises_con_hospitalizaciones"),
+        )
+    )
+
+    # Agregar hospitalizaciones por fecha (excluyendo negativos)
     hosp_agg_cols = []
     if "new_hospitalized_patients" in df_hosp_pais.columns:
-        hosp_agg_cols.append(F.sum("new_hospitalized_patients").alias("total_new_hospitalized"))
+        hosp_agg_cols.append(
+            F.sum(F.when(F.col("new_hospitalized_patients") >= 0,
+                         F.col("new_hospitalized_patients")))
+            .alias("total_new_hospitalized")
+        )
     if "new_intensive_care_patients" in df_hosp_pais.columns:
-        hosp_agg_cols.append(F.sum("new_intensive_care_patients").alias("total_new_intensive_care"))
+        hosp_agg_cols.append(
+            F.sum(F.when(F.col("new_intensive_care_patients") >= 0,
+                         F.col("new_intensive_care_patients")))
+            .alias("total_new_intensive_care")
+        )
     if "current_hospitalized_patients" in df_hosp_pais.columns:
-        hosp_agg_cols.append(F.sum("current_hospitalized_patients").alias("total_current_hospitalized"))
+        hosp_agg_cols.append(
+            F.sum(F.when(F.col("current_hospitalized_patients") >= 0,
+                         F.col("current_hospitalized_patients")))
+            .alias("total_current_hospitalized")
+        )
 
-    if hosp_agg_cols:
-        hosp_agg = df_hosp_pais.groupBy("date").agg(*hosp_agg_cols)
-    else:
-        logger.warning("No se encontraron columnas de hospitalizaciones.")
-        return epi_agg
+    hosp_agg = df_hosp_pais.groupBy("date").agg(*hosp_agg_cols)
 
     # Unir por fecha
-    df_join = epi_agg.join(hosp_agg, on="date", how="left")
+    df_join = epi_agg.join(hosp_agg, on="date", how="inner")
 
-    # Calcular ratio
+    # Calcular ratio sobre el conjunto comparable de países
     if "total_new_confirmed" in df_join.columns and "total_new_hospitalized" in df_join.columns:
         df_join = df_join.withColumn(
             "ratio_hospitalizados",
@@ -1193,9 +1387,19 @@ def calcular_distribucion_edad_sexo(df_by_age: DataFrame) -> DataFrame:
     if "new_deceased" in df_pais.columns:
         agg_cols.append(F.sum("new_deceased").alias("total_new_deceased"))
 
+    # Excluir negativos para que los totales sean consistentes con
+    # calcular_distribucion_por_edad(), que aplica el mismo filtro.
+    # Sin esto, las dos tablas de distribución por edad del proyecto
+    # mostrarían totales distintos para los mismos grupos.
+    filtros_sexo = F.col("age_bucket").isNotNull()
+    if "new_confirmed" in df_pais.columns:
+        filtros_sexo = filtros_sexo & (F.col("new_confirmed").isNull() | (F.col("new_confirmed") >= 0))
+    if "new_deceased" in df_pais.columns:
+        filtros_sexo = filtros_sexo & (F.col("new_deceased").isNull() | (F.col("new_deceased") >= 0))
+
     agg = (
         df_pais
-        .filter(F.col("age_bucket").isNotNull())
+        .filter(filtros_sexo)
         .groupBy("age_bucket")
         .agg(*agg_cols)
         .orderBy("age_bucket")
@@ -1240,7 +1444,7 @@ def calcular_relacion_clima_contagios(df_epidemiologia: DataFrame,
     df_epi_sel = df_epi_pais.select(*[c for c in epi_cols if c in df_epi_pais.columns])
     df_weather_sel = df_weather_pais.select(*[c for c in weather_cols if c in df_weather_pais.columns])
 
-    df_join = df_epi_sel.join(df_weather_sel, on=["date", "location_key"], how="inner")
+    df_join = df_epi_sel.join(df_weather_sel, on=["date", "location_key"], how="left")
 
     logger.info("Datos clima-contagios preparados: %d filas.", df_join.count())
     return df_join
