@@ -1,18 +1,3 @@
-"""
-test_transformacion.py
------------------------
-Pruebas automatizadas para el módulo de transformación.
-
-Verifica:
-- Que las transformaciones funcionen correctamente.
-- Que los tipos de datos sean correctos.
-- Que no se generen duplicados inesperados.
-- Que las fechas sean válidas.
-- Que las agregaciones sean correctas.
-
-NOTA: Como createDataFrame no funciona en este entorno (Python 3.14 + Spark),
-se usan archivos CSV temporales para crear DataFrames de prueba.
-"""
 
 import os
 import tempfile
@@ -88,7 +73,6 @@ class TestConvertirTipos:
         assert "date" == tipo_date["date"] or "DateType" in tipo_date["date"]
 
     def test_conversion_enteros(self, spark, csv_epidemiologia):
-        """Verifica que la conversión a enteros funcione."""
         df = spark.read.option("header", True).csv(str(csv_epidemiologia))
         df = convertir_tipos(df, {
             "new_confirmed": "long",
@@ -103,7 +87,6 @@ class TestConvertirTipos:
         assert "LongType" in tipos["cumulative_confirmed"]
 
     def test_conversion_columna_inexistente(self, spark, csv_epidemiologia):
-        """Verifica que no falle si una columna no existe."""
         df = spark.read.option("header", True).csv(str(csv_epidemiologia))
         # No debería lanzar error
         df = convertir_tipos(df, {"columna_inexistente": "long"})
@@ -111,10 +94,8 @@ class TestConvertirTipos:
 
 
 class TestEliminarDuplicados:
-    """Pruebas de eliminación de duplicados."""
 
     def test_elimina_duplicados(self, spark, csv_epidemiologia):
-        """Verifica que se eliminen los registros duplicados."""
         df = spark.read.option("header", True).csv(str(csv_epidemiologia))
         total_antes = df.count()
 
@@ -135,7 +116,6 @@ class TestEliminarDuplicados:
 
 
 class TestValidarNegativos:
-    """Pruebas de validación de negativos."""
 
     def test_detecta_negativos(self, spark, tmp_path):
         """Verifica que detecte valores negativos."""
@@ -173,15 +153,7 @@ class TestFiltrarColombia:
         assert total_col == 5, f"Se esperaban 5 registros de Colombia, hay {total_col}"
 
     def test_filtra_colombia_verifica_location_key(self, spark, tmp_path):
-        """
-        Verifica que todos los registros filtrados correspondan a Colombia.
-
-        filtrar_colombia() usa startswith("CO"), que incluye tanto el nivel
-        subregión (CO_Bogota, CO_Medellin) como el nivel país (CO).
-        El test anterior solo cubría location_keys con guión bajo; este test
-        añade una fila con location_key="CO" (nivel país) para garantizar que
-        también se incluye, y una fila "PE_Lima" para garantizar que se excluye.
-        """
+      
         ruta = tmp_path / "co_niveles.csv"
         ruta.write_text(
             "date,location_key,new_confirmed\n"
@@ -218,24 +190,9 @@ class TestFiltrarColombia:
         )
 
 
-# =============================================================================
-# Tests nuevos — Tarea 6
-# =============================================================================
-
-# ---------------------------------------------------------------------------
-# Fixtures adicionales
-# ---------------------------------------------------------------------------
-
 @pytest.fixture
 def csv_by_age_wide(tmp_path):
-    """
-    CSV en formato WIDE que simula la estructura de by-age.csv.
-
-    Contiene 2 grupos etarios (age_bin_0 = '0-9', age_bin_1 = '10-19')
-    con datos para 2 fechas en Colombia.  Columnas opcionales como
-    new_deceased_age_* y cumulative_* se incluyen para validar que el
-    unpivot las maneja correctamente.
-    """
+   
     ruta = tmp_path / "by_age_wide.csv"
     ruta.write_text(
         "date,location_key,"
@@ -256,15 +213,9 @@ def csv_by_age_wide(tmp_path):
 
 @pytest.fixture
 def csv_by_age_variantes_80(tmp_path):
-    """
-    CSV WIDE con variantes del grupo '80+' para probar la normalización.
-
-    Incluye '80-', '80-89' y '90+' como etiquetas del último grupo en
-    distintas filas para verificar que todas se unifican en '80+'.
-    """
     ruta = tmp_path / "by_age_80_variantes.csv"
     ruta.write_text(
-        "date,location_key,age_bin_0,new_confirmed_age_0\n"
+        "date,location_key,age_bucket,new_confirmed\n"
         "2020-01-01,CO,80-,100\n"
         "2020-01-02,CO,80-89,110\n"
         "2020-01-03,CO,90+,120\n"
@@ -275,13 +226,6 @@ def csv_by_age_variantes_80(tmp_path):
 
 @pytest.fixture
 def csv_epidemiologia_paises(tmp_path):
-    """
-    CSV de epidemiología con múltiples países y niveles geográficos.
-
-    Incluye registros a nivel país (CO, PE) y subregión (CO_25) para
-    verificar que calcular_promedio_casos_por_pais() filtra correctamente
-    al nivel país y no duplica conteos.
-    """
     ruta = tmp_path / "epi_paises.csv"
     ruta.write_text(
         "date,location_key,new_confirmed,new_deceased,cumulative_confirmed,cumulative_deceased,"
@@ -320,13 +264,6 @@ def csv_by_age_long(tmp_path):
 # ---------------------------------------------------------------------------
 
 class TestNormalizarAgeBucket:
-    """
-    Pruebas de normalización de etiquetas del grupo etario '80+'.
-
-    _expr_normalizar_age_bucket() debe unificar todas las variantes
-    conocidas ('80-', '80-89', '80-99', '90+', etc.) en '80+',
-    conservando sin cambios las demás etiquetas.
-    """
 
     def _aplicar_normalizacion(self, spark, tmp_path, contenido_csv):
         """Helper: lee CSV y aplica la expresión de normalización."""
@@ -503,15 +440,7 @@ class TestTransformarByAge:
 # ---------------------------------------------------------------------------
 
 class TestAgregaciones:
-    """
-    Pruebas para las funciones de agregación principales.
-
-    Verifican que:
-    - calcular_promedio_casos_por_pais() filtra a nivel país y agrupa por country_name.
-    - calcular_distribucion_por_edad() agrupa por age_bucket y excluye negativos.
-    - calcular_evolucion_temporal() agrupa por fecha a nivel país.
-    """
-
+ 
     def test_promedio_casos_filtra_nivel_pais(self, spark, csv_epidemiologia_paises):
         """
         calcular_promedio_casos_por_pais() no debe incluir registros de subregiones
