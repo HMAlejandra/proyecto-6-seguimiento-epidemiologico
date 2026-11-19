@@ -1,31 +1,3 @@
-"""
-anova.py
---------
-Análisis estadístico ANOVA para comparar tasas de contagio entre grupos etarios.
-
-Pregunta de investigación:
-    ¿Existen diferencias estadísticamente significativas entre las tasas
-    de contagio de los diferentes grupos etarios?
-
-Hipótesis:
-    H0: Las medias de las tasas de contagio de los diferentes grupos etarios
-        son iguales.
-    H1: Al menos una de las medias de las tasas de contagio de los grupos
-        etarios es diferente.
-
-Nivel de significancia: α = 0.05
-
-Pruebas ejecutadas:
-1. Shapiro-Wilk para evaluar normalidad de los residuos.
-2. Levene para evaluar homogeneidad de varianzas.
-3. ANOVA clásico (one-way) cuando se cumplen los supuestos.
-4. Welch ANOVA cuando hay heterogeneidad de varianzas.
-5. Kruskal-Wallis cuando el análisis no paramétrico es más apropiado.
-6. Tukey HSD para comparaciones posteriores (cuando corresponde).
-
-NO se inventan resultados, valores F, valores p ni conclusiones.
-"""
-
 import logging
 from pathlib import Path
 from datetime import datetime
@@ -44,7 +16,6 @@ RESULTADOS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _guardar_resultado(nombre: str, contenido: str):
-    """Guarda un resultado en un archivo de texto en la carpeta resultados/."""
     ruta = RESULTADOS_DIR / f"{nombre}.txt"
     with open(ruta, "w", encoding="utf-8") as f:
         f.write(contenido)
@@ -52,23 +23,7 @@ def _guardar_resultado(nombre: str, contenido: str):
 
 
 def probar_normalidad(grupos: dict) -> dict:
-    """
-    Evalúa la normalidad de los residuos usando Shapiro-Wilk.
 
-    Como las muestras pueden ser grandes, Shapiro-Wilk puede ser muy sensible.
-    Se aplica a una muestra aleatoria de como máximo 5000 observaciones por grupo
-    (Shapiro-Wilk pierde potencia con muestras muy grandes).
-
-    Parámetros
-    ----------
-    grupos : dict
-        {nombre_grupo: numpy.array de valores}
-
-    Retorna
-    -------
-    dict
-        {grupo: {estadistico_shapiro, p_valor, es_normal}}
-    """
     logger.info("-" * 40)
     logger.info("PRUEBA DE NORMALIDAD (Shapiro-Wilk)")
 
@@ -108,19 +63,6 @@ def probar_normalidad(grupos: dict) -> dict:
 
 
 def probar_homogeneidad_varianzas(grupos: dict) -> dict:
-    """
-    Evalúa la homogeneidad de varianzas usando la prueba de Levene.
-
-    Parámetros
-    ----------
-    grupos : dict
-        {nombre_grupo: numpy.array de valores}
-
-    Retorna
-    -------
-    dict
-        {estadistico_levene, p_valor, varianzas_homogeneas}
-    """
     logger.info("-" * 40)
     logger.info("PRUEBA DE HOMOGENEIDAD DE VARIANZAS (Levene)")
 
@@ -147,19 +89,6 @@ def probar_homogeneidad_varianzas(grupos: dict) -> dict:
 
 
 def ejecutar_anova_clasico(grupos: dict) -> dict:
-    """
-    Ejecuta ANOVA clásico de un factor (one-way ANOVA).
-
-    Parámetros
-    ----------
-    grupos : dict
-        {nombre_grupo: numpy.array de valores}
-
-    Retorna
-    -------
-    dict
-        {estadistico_F, p_valor, grados_libertad_entre, grados_libertad_dentro}
-    """
     logger.info("-" * 40)
     logger.info("ANOVA CLÁSICO (One-Way)")
 
@@ -192,14 +121,6 @@ def ejecutar_anova_clasico(grupos: dict) -> dict:
 
 
 def ejecutar_welch_anova(grupos: dict) -> dict:
-    """
-    Ejecuta Welch ANOVA (robusto a heterogeneidad de varianzas).
-
-    Retorna
-    -------
-    dict
-        {estadistico_F, p_valor}
-    """
     logger.info("-" * 40)
     logger.info("WELCH ANOVA")
 
@@ -259,14 +180,6 @@ def ejecutar_welch_anova(grupos: dict) -> dict:
 
 
 def ejecutar_kruskal_wallis(grupos: dict) -> dict:
-    """
-    Ejecuta la prueba no paramétrica de Kruskal-Wallis.
-
-    Retorna
-    -------
-    dict
-        {estadistico_H, p_valor}
-    """
     logger.info("-" * 40)
     logger.info("KRUSKAL-WALLIS (No Paramétrico)")
 
@@ -284,19 +197,6 @@ def ejecutar_kruskal_wallis(grupos: dict) -> dict:
 
 
 def ejecutar_tukey_hsd(grupos: dict) -> dict:
-    """
-    Ejecuta comparaciones posteriores con Tukey HSD.
-
-    Parámetros
-    ----------
-    grupos : dict
-        {nombre_grupo: numpy.array de valores}
-
-    Retorna
-    -------
-    dict
-        Resultados de las comparaciones pairwise.
-    """
     logger.info("-" * 40)
     logger.info("COMPARACIONES POSTERIORES (Tukey HSD)")
 
@@ -324,28 +224,6 @@ def ejecutar_tukey_hsd(grupos: dict) -> dict:
 
 
 def ejecutar_anova(datos_preparados: dict) -> dict:
-    """
-    Ejecuta el análisis ANOVA completo con verificación de supuestos.
-
-    Flujo:
-    1. Verificar que hay datos suficientes.
-    2. Probar normalidad (Shapiro-Wilk).
-    3. Probar homogeneidad de varianzas (Levene).
-    4. Si se cumplen supuestos → ANOVA clásico + Tukey HSD.
-    5. Si no hay homogeneidad → Welch ANOVA.
-    6. Si no hay normalidad → Kruskal-Wallis.
-    7. Guardar resultados.
-
-    Parámetros
-    ----------
-    datos_preparados : dict
-        Diccionario con 'grupos' y 'metadatos' de preparar_datos_anova().
-
-    Retorna
-    -------
-    dict
-        Resultados completos del análisis.
-    """
     logger.info("=" * 60)
     logger.info("ANÁLISIS ESTADÍSTICO ANOVA")
     logger.info("=" * 60)

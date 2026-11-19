@@ -1,21 +1,3 @@
-"""
-extraccion.py
--------------
-Descarga de datos desde las fuentes oficiales.
-
-Fuentes principales:
-- Google Cloud Platform — COVID-19 Open Data (v3)
-  Repositorio histórico, dejó de actualizarse en septiembre de 2022.
-
-Responsabilidades:
-1. Descargar los archivos de Google Cloud Platform.
-2. Comprobar que las descargas sean exitosas.
-3. Guardar los archivos originales en data/raw/google/.
-4. Evitar descargar nuevamente archivos si ya existen y son válidos.
-5. Manejar errores de conexión.
-6. Registrar las descargas en los logs.
-"""
-
 import logging
 import os
 from pathlib import Path
@@ -83,19 +65,7 @@ def _ensure_dirs():
 
 
 def _is_file_valid(filepath: Path) -> bool:
-    """
-    Verifica si un archivo ya existe y tiene un tamaño razonable.
-
-    Parámetros
-    ----------
-    filepath : Path
-        Ruta del archivo a verificar.
-
-    Retorna
-    -------
-    bool
-        True si el archivo existe y su tamaño es >= MIN_FILE_SIZE_BYTES.
-    """
+   
     if not filepath.exists():
         return False
     size = filepath.stat().st_size
@@ -106,28 +76,7 @@ def _is_file_valid(filepath: Path) -> bool:
 
 
 def descargar_archivo(nombre: str, url: str, destino: Path, forzar: bool = False) -> bool:
-    """
-    Descarga un archivo desde una URL y lo guarda en destino.
-
-    Si el archivo ya existe y es válido, no lo descarga nuevamente
-    (salvo que forzar=True).
-
-    Parámetros
-    ----------
-    nombre : str
-        Nombre identificador del archivo (para logs).
-    url : str
-        URL de descarga.
-    destino : Path
-        Ruta local donde guardar el archivo.
-    forzar : bool
-        Si True, descarga incluso si el archivo ya existe y es válido.
-
-    Retorna
-    -------
-    bool
-        True si el archivo existe y es válido al finalizar, False si falló.
-    """
+    
     # Verificar si ya existe y es válido
     if not forzar and _is_file_valid(destino):
         size_mb = destino.stat().st_size / (1024 * 1024)
@@ -164,20 +113,7 @@ def descargar_archivo(nombre: str, url: str, destino: Path, forzar: bool = False
 
 
 def descargar_google(forzar: bool = False) -> dict:
-    """
-    Descarga todos los archivos de Google Cloud Platform.
-
-    Parámetros
-    ----------
-    forzar : bool
-        Si True, descarga nuevamente incluso los archivos que ya existen.
-
-    Retorna
-    -------
-    dict
-        Diccionario con el estado de cada archivo:
-        {nombre: {"exitoso": bool, "ruta": str, "tamano_mb": float}}
-    """
+   
     _ensure_dirs()
 
     resultados = {}
@@ -207,74 +143,14 @@ def descargar_google(forzar: bool = False) -> dict:
     return resultados
 
 
-def investigar_who() -> dict:
-    """
-    Investiga la disponibilidad de datos descargables de la OMS.
-
-    La OMS publica datos de COVID-19 en:
-    https://data.who.int/dashboards/covid19/data
-
-    Tras investigación, la OMS ofrece datos a través de su API:
-    https://ghoapi.azureedge.net/api/Indicator
-    y dashboards interactivos, pero no ofrece archivos CSV descargables
-    directamente con la misma estructura que Google Cloud Platform.
-
-    La integración con Google Cloud Platform no es directa porque:
-    - Las definiciones de variables difieren.
-    - La granularidad temporal y geográfica es distinta.
-    - Las claves de integración (códigos de país) usan sistemas diferentes.
-
-    Por lo tanto, se documenta la limitación y se mantiene Google Cloud
-    Platform como fuente principal.
-
-    Retorna
-    -------
-    dict
-        Diccionario con el resultado de la investigación.
-    """
-    logger.info("Investigando disponibilidad de datos de la OMS...")
-
-    resultado = {
-        "fuente": "Organización Mundial de la Salud (OMS)",
-        "url_portal": "https://data.who.int/dashboards/covid19/data",
-        "encontrada": False,
-        "motivo": (
-            "La OMS ofrece un dashboard interactivo y una API (GHO API), "
-            "pero no proporciona archivos CSV descargables directamente con "
-            "una estructura compatible con Google Cloud Platform. "
-            "Las definiciones de variables, granularidad y claves de "
-            "integración difieren entre fuentes. "
-            "Se mantiene Google Cloud Platform como fuente principal."
-        ),
-        "archivos_descargados": [],
-    }
-
-    logger.warning("OMS: %s", resultado["motivo"])
-
-    return resultado
-
-
 def descargar_todas_las_fuentes(forzar: bool = False) -> dict:
-    """
-    Coordina la descarga de todas las fuentes disponibles.
-
-    Parámetros
-    ----------
-    forzar : bool
-        Si True, descarga nuevamente incluso los archivos que ya existen.
-
-    Retorna
-    -------
-    dict
-        Resultado consolidado de todas las descargas.
-    """
+    
     logger.info("=" * 60)
     logger.info("INICIANDO DESCARGA DE FUENTES DE DATOS")
     logger.info("=" * 60)
 
     resultados = {
-        "google": descargar_google(forzar=forzar),
-        "who": investigar_who(),
+        "google": descargar_google(forzar=forzar)
     }
 
     # Resumen general
