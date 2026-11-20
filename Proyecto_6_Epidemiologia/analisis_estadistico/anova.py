@@ -322,22 +322,73 @@ Tamaño de muestra por grupo:
 
     if p_valor_principal is not None:
         decision = "Rechazar H0" if p_valor_principal < 0.05 else "No rechazar H0"
+
+        # Formatear p con notación científica cuando es muy pequeño
+        if p_valor_principal < 1e-4:
+            p_formateado = f"{p_valor_principal:.2e}"
+        else:
+            p_formateado = f"{p_valor_principal:.6f}"
+
+        # La interpretación sustantiva depende de la prueba usada:
+        # - ANOVA clásico y Welch ANOVA comparan medias → "diferencias entre medias"
+        # - Kruskal-Wallis compara distribuciones (no asume normalidad ni igualdad
+        #   de varianzas) → "diferencias en la distribución / tendencia central"
+        if prueba_principal == "Kruskal-Wallis":
+            descripcion_diferencia = (
+                "diferencias estadísticamente significativas en la distribución "
+                "(tendencia central) de las tasas de contagio entre los grupos etarios"
+            )
+            descripcion_sin_diferencia = (
+                "no hay evidencia suficiente para afirmar que existen diferencias "
+                "en la distribución de las tasas de contagio entre los grupos etarios"
+            )
+            nota_prueba = (
+                " Kruskal-Wallis es una prueba no paramétrica que evalúa si las "
+                "distribuciones de los grupos difieren; no compara medias directamente. "
+                "Para identificar qué pares de grupos difieren entre sí se requieren "
+                "comparaciones post-hoc (p.ej. Dunn con corrección de Bonferroni)."
+            )
+        else:
+            descripcion_diferencia = (
+                "diferencias estadísticamente significativas entre las medias "
+                "de las tasas de contagio de los grupos etarios"
+            )
+            descripcion_sin_diferencia = (
+                "no hay evidencia suficiente para afirmar que existen diferencias "
+                "significativas entre las medias de los grupos etarios"
+            )
+            nota_prueba = (
+                " Para identificar qué pares de grupos difieren se recomienda "
+                "revisar las comparaciones post-hoc de Tukey HSD."
+            )
+
+        nota_temporal = (
+            " ADVERTENCIA: las observaciones son registros diarios consecutivos, "
+            "lo que introduce correlación temporal. El valor p debe interpretarse "
+            "con cautela: un resultado significativo no es por sí solo evidencia "
+            "confirmatoria cuando no se garantiza la independencia entre observaciones."
+        )
+
+        interpretacion = (
+            f"Con un nivel de significancia α=0.05, el valor p={p_formateado} "
+            f"{'es menor que' if p_valor_principal < 0.05 else 'es mayor que'} α, "
+            f"por lo que {'se rechaza' if p_valor_principal < 0.05 else 'no se rechaza'} "
+            f"la hipótesis nula. "
+            + (descripcion_diferencia if p_valor_principal < 0.05
+               else descripcion_sin_diferencia)
+            + "."
+            + nota_prueba
+            + nota_temporal
+        )
+
         resultados["decision"] = {
             "prueba": prueba_principal,
             "p_valor": p_valor_principal,
+            "p_valor_formateado": p_formateado,
             "decision": decision,
-            "interpretacion": (
-                f"Con un nivel de significancia α=0.05, el valor p={p_valor_principal:.6f} "
-                f"{'es menor que' if p_valor_principal < 0.05 else 'es mayor que'} α, "
-                f"por lo que {'se rechaza' if p_valor_principal < 0.05 else 'no se rechaza'} "
-                f"la hipótesis nula. "
-                + ("Existen diferencias estadísticamente significativas entre las medias "
-                   "de los grupos etarios." if p_valor_principal < 0.05 else
-                   "No hay evidencia suficiente para afirmar que existen diferencias "
-                   "significativas entre las medias de los grupos etarios.")
-            ),
+            "interpretacion": interpretacion,
         }
-        logger.info("DECISIÓN: %s (p=%.6f)", decision, p_valor_principal)
+        logger.info("DECISIÓN: %s (p=%s)", decision, p_formateado)
     else:
         resultados["decision"] = {"error": "No se pudo calcular el valor p principal."}
 
@@ -482,7 +533,11 @@ def _guardar_resultado_completo(resultados: dict):
     decision = resultados.get("decision", {})
     contenido.append(f"Prueba principal: {resultados.get('prueba_principal', '?')}\n")
     if decision.get("p_valor") is not None:
-        contenido.append(f"Valor p: {decision['p_valor']:.6f}\n")
+        p_fmt = decision.get("p_valor_formateado") or (
+            f"{decision['p_valor']:.2e}" if decision["p_valor"] < 1e-4
+            else f"{decision['p_valor']:.6f}"
+        )
+        contenido.append(f"Valor p: {p_fmt}\n")
         contenido.append(f"Decisión: {decision['decision']}\n")
         contenido.append(f"\nInterpretación:\n{decision['interpretacion']}\n")
     elif decision.get("error"):
@@ -491,12 +546,13 @@ def _guardar_resultado_completo(resultados: dict):
     contenido.append("\n" + "=" * 60 + "\n")
     contenido.append("ADVERTENCIA METODOLÓGICA\n")
     contenido.append("=" * 60 + "\n")
-    contenido.append(
-        "Este análisis usa new_confirmed (conteos absolutos), NO tasas de contagio.\n"
-        "by-age.csv no incluye denominadores poblacionales por grupo etario.\n"
-        "Un resultado significativo puede deberse a diferencias de tamaño poblacional\n"
-        "entre grupos, no a diferencias reales de riesgo epidemiológico.\n"
-    )
+    # Usar el texto generado condicionalmente en ejecutar_anova() según usar_tasas,
+    # en lugar de texto hardcodeado que siempre describía conteos absolutos.
+    advertencia = resultados.get("advertencia_metodologica", "")
+    if advertencia:
+        contenido.append(advertencia + "\n")
+    else:
+        contenido.append("Ver metadatos para detalles sobre la variable analizada.\n")
 
     contenido.append("\n" + "=" * 60 + "\n")
     contenido.append("LIMITACIONES\n")
