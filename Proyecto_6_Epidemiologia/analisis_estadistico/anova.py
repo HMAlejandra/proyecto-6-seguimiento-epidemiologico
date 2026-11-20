@@ -1,31 +1,3 @@
-"""
-anova.py
---------
-Análisis estadístico ANOVA para comparar tasas de contagio entre grupos etarios.
-
-Pregunta de investigación:
-    ¿Existen diferencias estadísticamente significativas entre las tasas
-    de contagio de los diferentes grupos etarios?
-
-Hipótesis:
-    H0: Las medias de las tasas de contagio de los diferentes grupos etarios
-        son iguales.
-    H1: Al menos una de las medias de las tasas de contagio de los grupos
-        etarios es diferente.
-
-Nivel de significancia: α = 0.05
-
-Pruebas ejecutadas:
-1. Shapiro-Wilk para evaluar normalidad de los residuos.
-2. Levene para evaluar homogeneidad de varianzas.
-3. ANOVA clásico (one-way) cuando se cumplen los supuestos.
-4. Welch ANOVA cuando hay heterogeneidad de varianzas.
-5. Kruskal-Wallis cuando el análisis no paramétrico es más apropiado.
-6. Tukey HSD para comparaciones posteriores (cuando corresponde).
-
-NO se inventan resultados, valores F, valores p ni conclusiones.
-"""
-
 import logging
 from pathlib import Path
 from datetime import datetime
@@ -44,7 +16,6 @@ RESULTADOS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _guardar_resultado(nombre: str, contenido: str):
-    """Guarda un resultado en un archivo de texto en la carpeta resultados/."""
     ruta = RESULTADOS_DIR / f"{nombre}.txt"
     with open(ruta, "w", encoding="utf-8") as f:
         f.write(contenido)
@@ -52,23 +23,7 @@ def _guardar_resultado(nombre: str, contenido: str):
 
 
 def probar_normalidad(grupos: dict) -> dict:
-    """
-    Evalúa la normalidad de los residuos usando Shapiro-Wilk.
 
-    Como las muestras pueden ser grandes, Shapiro-Wilk puede ser muy sensible.
-    Se aplica a una muestra aleatoria de como máximo 5000 observaciones por grupo
-    (Shapiro-Wilk pierde potencia con muestras muy grandes).
-
-    Parámetros
-    ----------
-    grupos : dict
-        {nombre_grupo: numpy.array de valores}
-
-    Retorna
-    -------
-    dict
-        {grupo: {estadistico_shapiro, p_valor, es_normal}}
-    """
     logger.info("-" * 40)
     logger.info("PRUEBA DE NORMALIDAD (Shapiro-Wilk)")
 
@@ -108,19 +63,6 @@ def probar_normalidad(grupos: dict) -> dict:
 
 
 def probar_homogeneidad_varianzas(grupos: dict) -> dict:
-    """
-    Evalúa la homogeneidad de varianzas usando la prueba de Levene.
-
-    Parámetros
-    ----------
-    grupos : dict
-        {nombre_grupo: numpy.array de valores}
-
-    Retorna
-    -------
-    dict
-        {estadistico_levene, p_valor, varianzas_homogeneas}
-    """
     logger.info("-" * 40)
     logger.info("PRUEBA DE HOMOGENEIDAD DE VARIANZAS (Levene)")
 
@@ -147,19 +89,6 @@ def probar_homogeneidad_varianzas(grupos: dict) -> dict:
 
 
 def ejecutar_anova_clasico(grupos: dict) -> dict:
-    """
-    Ejecuta ANOVA clásico de un factor (one-way ANOVA).
-
-    Parámetros
-    ----------
-    grupos : dict
-        {nombre_grupo: numpy.array de valores}
-
-    Retorna
-    -------
-    dict
-        {estadistico_F, p_valor, grados_libertad_entre, grados_libertad_dentro}
-    """
     logger.info("-" * 40)
     logger.info("ANOVA CLÁSICO (One-Way)")
 
@@ -192,14 +121,6 @@ def ejecutar_anova_clasico(grupos: dict) -> dict:
 
 
 def ejecutar_welch_anova(grupos: dict) -> dict:
-    """
-    Ejecuta Welch ANOVA (robusto a heterogeneidad de varianzas).
-
-    Retorna
-    -------
-    dict
-        {estadistico_F, p_valor}
-    """
     logger.info("-" * 40)
     logger.info("WELCH ANOVA")
 
@@ -259,14 +180,6 @@ def ejecutar_welch_anova(grupos: dict) -> dict:
 
 
 def ejecutar_kruskal_wallis(grupos: dict) -> dict:
-    """
-    Ejecuta la prueba no paramétrica de Kruskal-Wallis.
-
-    Retorna
-    -------
-    dict
-        {estadistico_H, p_valor}
-    """
     logger.info("-" * 40)
     logger.info("KRUSKAL-WALLIS (No Paramétrico)")
 
@@ -284,19 +197,6 @@ def ejecutar_kruskal_wallis(grupos: dict) -> dict:
 
 
 def ejecutar_tukey_hsd(grupos: dict) -> dict:
-    """
-    Ejecuta comparaciones posteriores con Tukey HSD.
-
-    Parámetros
-    ----------
-    grupos : dict
-        {nombre_grupo: numpy.array de valores}
-
-    Retorna
-    -------
-    dict
-        Resultados de las comparaciones pairwise.
-    """
     logger.info("-" * 40)
     logger.info("COMPARACIONES POSTERIORES (Tukey HSD)")
 
@@ -324,28 +224,6 @@ def ejecutar_tukey_hsd(grupos: dict) -> dict:
 
 
 def ejecutar_anova(datos_preparados: dict) -> dict:
-    """
-    Ejecuta el análisis ANOVA completo con verificación de supuestos.
-
-    Flujo:
-    1. Verificar que hay datos suficientes.
-    2. Probar normalidad (Shapiro-Wilk).
-    3. Probar homogeneidad de varianzas (Levene).
-    4. Si se cumplen supuestos → ANOVA clásico + Tukey HSD.
-    5. Si no hay homogeneidad → Welch ANOVA.
-    6. Si no hay normalidad → Kruskal-Wallis.
-    7. Guardar resultados.
-
-    Parámetros
-    ----------
-    datos_preparados : dict
-        Diccionario con 'grupos' y 'metadatos' de preparar_datos_anova().
-
-    Retorna
-    -------
-    dict
-        Resultados completos del análisis.
-    """
     logger.info("=" * 60)
     logger.info("ANÁLISIS ESTADÍSTICO ANOVA")
     logger.info("=" * 60)
@@ -444,26 +322,110 @@ Tamaño de muestra por grupo:
 
     if p_valor_principal is not None:
         decision = "Rechazar H0" if p_valor_principal < 0.05 else "No rechazar H0"
+
+        # Formatear p con notación científica cuando es muy pequeño
+        if p_valor_principal < 1e-4:
+            p_formateado = f"{p_valor_principal:.2e}"
+        else:
+            p_formateado = f"{p_valor_principal:.6f}"
+
+        # La interpretación sustantiva depende de la prueba usada:
+        # - ANOVA clásico y Welch ANOVA comparan medias → "diferencias entre medias"
+        # - Kruskal-Wallis compara distribuciones (no asume normalidad ni igualdad
+        #   de varianzas) → "diferencias en la distribución / tendencia central"
+        if prueba_principal == "Kruskal-Wallis":
+            descripcion_diferencia = (
+                "diferencias estadísticamente significativas en la distribución "
+                "(tendencia central) de las tasas de contagio entre los grupos etarios"
+            )
+            descripcion_sin_diferencia = (
+                "no hay evidencia suficiente para afirmar que existen diferencias "
+                "en la distribución de las tasas de contagio entre los grupos etarios"
+            )
+            nota_prueba = (
+                " Kruskal-Wallis es una prueba no paramétrica que evalúa si las "
+                "distribuciones de los grupos difieren; no compara medias directamente. "
+                "Para identificar qué pares de grupos difieren entre sí se requieren "
+                "comparaciones post-hoc (p.ej. Dunn con corrección de Bonferroni)."
+            )
+        else:
+            descripcion_diferencia = (
+                "diferencias estadísticamente significativas entre las medias "
+                "de las tasas de contagio de los grupos etarios"
+            )
+            descripcion_sin_diferencia = (
+                "no hay evidencia suficiente para afirmar que existen diferencias "
+                "significativas entre las medias de los grupos etarios"
+            )
+            nota_prueba = (
+                " Para identificar qué pares de grupos difieren se recomienda "
+                "revisar las comparaciones post-hoc de Tukey HSD."
+            )
+
+        nota_temporal = (
+            " ADVERTENCIA: las observaciones son registros diarios consecutivos, "
+            "lo que introduce correlación temporal. El valor p debe interpretarse "
+            "con cautela: un resultado significativo no es por sí solo evidencia "
+            "confirmatoria cuando no se garantiza la independencia entre observaciones."
+        )
+
+        interpretacion = (
+            f"Con un nivel de significancia α=0.05, el valor p={p_formateado} "
+            f"{'es menor que' if p_valor_principal < 0.05 else 'es mayor que'} α, "
+            f"por lo que {'se rechaza' if p_valor_principal < 0.05 else 'no se rechaza'} "
+            f"la hipótesis nula. "
+            + (descripcion_diferencia if p_valor_principal < 0.05
+               else descripcion_sin_diferencia)
+            + "."
+            + nota_prueba
+            + nota_temporal
+        )
+
         resultados["decision"] = {
             "prueba": prueba_principal,
             "p_valor": p_valor_principal,
+            "p_valor_formateado": p_formateado,
             "decision": decision,
-            "interpretacion": (
-                f"Con un nivel de significancia α=0.05, el valor p={p_valor_principal:.6f} "
-                f"{'es menor que' if p_valor_principal < 0.05 else 'es mayor que'} α, "
-                f"por lo que {'se rechaza' if p_valor_principal < 0.05 else 'no se rechaza'} "
-                f"la hipótesis nula. "
-                + ("Existen diferencias estadísticamente significativas entre las medias "
-                   "de los grupos etarios." if p_valor_principal < 0.05 else
-                   "No hay evidencia suficiente para afirmar que existen diferencias "
-                   "significativas entre las medias de los grupos etarios.")
-            ),
+            "interpretacion": interpretacion,
         }
-        logger.info("DECISIÓN: %s (p=%.6f)", decision, p_valor_principal)
+        logger.info("DECISIÓN: %s (p=%s)", decision, p_formateado)
     else:
         resultados["decision"] = {"error": "No se pudo calcular el valor p principal."}
 
-    # 5. Guardar resultados
+    # 5. Advertencia metodológica sobre conteos vs tasas.
+    # Solo se muestra si preparacion_anova no pudo calcular tasas reales
+    # (usar_tasas=False). Si se calcularon tasas aproximadas con demographics,
+    # emitir esta advertencia sería factualmente incorrecto.
+    usar_tasas = metadatos.get("usar_tasas", False)
+    if not usar_tasas:
+        advertencia_conteos = (
+            "\n⚠ ADVERTENCIA METODOLÓGICA — CONTEOS VS TASAS\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Este análisis usa new_confirmed (conteos absolutos de casos), NO tasas de contagio.\n"
+            "La pregunta de investigación menciona 'tasas de contagio por grupo etario', pero\n"
+            "el cruce con demographics no fue posible o no produjo denominadores válidos.\n\n"
+            "Implicación: grupos etarios más numerosos (ej. adultos de 30-50 años) tendrán\n"
+            "sistemáticamente más casos que grupos menos numerosos (ej. mayores de 80),\n"
+            "incluso si su riesgo relativo de contagio es menor. Un resultado estadísticamente\n"
+            "significativo puede deberse a diferencias de tamaño poblacional entre grupos,\n"
+            "no a diferencias reales de riesgo epidemiológico.\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        )
+        logger.warning(advertencia_conteos)
+        resultados["advertencia_metodologica"] = advertencia_conteos.strip()
+    else:
+        nota_tasas = (
+            "\nℹ VARIABLE ANALIZADA: tasas aproximadas por 100 000 hab.\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Se calcularon tasas aproximadas usando denominadores de demographics.csv.\n"
+            "Los denominadores son proporciones de la población total del país, NO conteos\n"
+            "absolutos por grupo etario; las tasas son aproximaciones documentadas.\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        )
+        logger.info(nota_tasas)
+        resultados["advertencia_metodologica"] = nota_tasas.strip()
+
+    # 6. Guardar resultados
     _guardar_resultado_completo(resultados)
 
     logger.info("=" * 60)
@@ -571,11 +533,26 @@ def _guardar_resultado_completo(resultados: dict):
     decision = resultados.get("decision", {})
     contenido.append(f"Prueba principal: {resultados.get('prueba_principal', '?')}\n")
     if decision.get("p_valor") is not None:
-        contenido.append(f"Valor p: {decision['p_valor']:.6f}\n")
+        p_fmt = decision.get("p_valor_formateado") or (
+            f"{decision['p_valor']:.2e}" if decision["p_valor"] < 1e-4
+            else f"{decision['p_valor']:.6f}"
+        )
+        contenido.append(f"Valor p: {p_fmt}\n")
         contenido.append(f"Decisión: {decision['decision']}\n")
         contenido.append(f"\nInterpretación:\n{decision['interpretacion']}\n")
     elif decision.get("error"):
         contenido.append(f"Error: {decision['error']}\n")
+
+    contenido.append("\n" + "=" * 60 + "\n")
+    contenido.append("ADVERTENCIA METODOLÓGICA\n")
+    contenido.append("=" * 60 + "\n")
+    # Usar el texto generado condicionalmente en ejecutar_anova() según usar_tasas,
+    # en lugar de texto hardcodeado que siempre describía conteos absolutos.
+    advertencia = resultados.get("advertencia_metodologica", "")
+    if advertencia:
+        contenido.append(advertencia + "\n")
+    else:
+        contenido.append("Ver metadatos para detalles sobre la variable analizada.\n")
 
     contenido.append("\n" + "=" * 60 + "\n")
     contenido.append("LIMITACIONES\n")

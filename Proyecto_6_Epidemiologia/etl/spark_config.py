@@ -1,18 +1,4 @@
-"""
-spark_config.py
----------------
-Configuración centralizada de la sesión Apache Spark para el Proyecto 6.
 
-Configura automáticamente las variables de entorno necesarias para ejecutar
-PySpark en Windows:
-- PYSPARK_PYTHON / PYSPARK_DRIVER_PYTHON: apuntan a Python 3.12 (compatible con PySpark).
-- HADOOP_HOME: ruta donde se encuentra winutils.exe (necesario para escritura en Windows).
-
-Reglas de uso:
-- Llama a get_spark_session() para obtener (o reutilizar) la sesión activa.
-- Llama a stop_spark_session() al finalizar el proceso ETL para liberar recursos.
-- No crees múltiples sesiones simultáneas; Spark mantiene un singleton por proceso.
-"""
 
 import logging
 import os
@@ -21,18 +7,16 @@ from pyspark.sql import SparkSession
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Configuración de entorno para PySpark en Windows
-# ---------------------------------------------------------------------------
-
-# Ruta al ejecutable de Python 3.12 (compatible con PySpark 4.0.0).
-# Python 3.14 (versión por defecto del sistema) tiene incompatibilidades con el
-# protocolo de workers de Spark, por lo que usamos Python 3.12 explícitamente.
-PYTHON_312_PATH = r"C:\Users\helen\AppData\Local\Programs\Python\Python312\python.exe"
+_DEFAULT_PYTHON_312 = r"C:\Python312\python.exe"
+PYTHON_312_PATH = os.environ.get("PYSPARK_PYTHON_312", _DEFAULT_PYTHON_312)
 
 # Ruta a la instalación de Hadoop (winutils.exe) necesaria para operaciones
 # de escritura de Spark en Windows.
-HADOOP_HOME = r"C:\hadoop"
+#
+# Se lee de la variable de entorno HADOOP_HOME si está definida.
+# Si no, se usa C:\hadoop como valor por defecto.
+#   $env:HADOOP_HOME = "C:\hadoop"
+HADOOP_HOME = os.environ.get("HADOOP_HOME", r"C:\hadoop")
 
 
 def _configure_spark_env():
@@ -74,26 +58,7 @@ def _configure_spark_env():
 
 
 def get_spark_session(app_name: str = "Proyecto6_Epidemiologia") -> SparkSession:
-    """
-    Crea o recupera la sesión Spark configurada para ejecución local.
-
-    Configuración aplicada:
-    - master: local[*]  → usa todos los núcleos disponibles en la máquina local.
-    - driver memory: 4g → memoria asignada al driver (ajustable según equipo).
-    - Serialización Kryo para mejor rendimiento.
-    - Log level WARNING para reducir ruido en consola.
-    - Variables de entorno PYSPARK_PYTHON y HADOOP_HOME configuradas automáticamente.
-
-    Parámetros
-    ----------
-    app_name : str
-        Nombre de la aplicación Spark visible en la Spark UI.
-
-    Retorna
-    -------
-    SparkSession
-        Sesión activa de Spark.
-    """
+   
     # Configurar variables de entorno ANTES de crear la sesión
     _configure_spark_env()
 
@@ -117,8 +82,11 @@ def get_spark_session(app_name: str = "Proyecto6_Epidemiologia") -> SparkSession
         .config("spark.sql.shuffle.partitions", "8")
         # Permite sobre-escritura de archivos Parquet/CSV ya existentes
         .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
-        # Evita advertencias de deprecación en lectura de CSV con encabezado
-        .config("spark.sql.legacy.timeParserPolicy", "LEGACY")
+        # Parser de fechas estricto: falla ruidosamente ante fechas malformadas
+        # en lugar de enmascarar errores con el modo LEGACY.
+        # Si algún CSV de la fuente tiene fechas en formato no estándar y el
+        # pipeline falla aquí, revisar extraccion.py para limpiar ese campo antes.
+        .config("spark.sql.legacy.timeParserPolicy", "CORRECTED")
         # Ruta del warehouse local de Spark (evita crear spark-warehouse en raíz)
         .config(
             "spark.sql.warehouse.dir",
@@ -140,12 +108,7 @@ def get_spark_session(app_name: str = "Proyecto6_Epidemiologia") -> SparkSession
 
 
 def stop_spark_session() -> None:
-    """
-    Detiene la sesión Spark activa de forma segura.
-
-    Debe llamarse al finalizar el proceso ETL para liberar todos los recursos
-    de la JVM subyacente.
-    """
+   
     session = SparkSession.getActiveSession()
     if session is not None:
         logger.info("Deteniendo sesión Spark: %s", session.sparkContext.appName)

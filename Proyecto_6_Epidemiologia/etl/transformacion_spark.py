@@ -1,29 +1,3 @@
-"""
-transformacion_spark.py
------------------------
-Transformación de datos con PySpark.
-
-Esta etapa se desarrolla principalmente con PySpark y realiza:
-1. Lectura de archivos originales.
-2. Estandarización de nombres de columnas.
-3. Conversión de tipos de datos.
-4. Normalización de fechas.
-5. Tratamiento de valores nulos (sin reemplazar por cero automáticamente).
-6. Identificación de registros duplicados.
-7. Validación de valores negativos o inconsistentes.
-8. Estandarización de países y regiones.
-9. Limpieza de variables epidemiológicas.
-10. Preparación de conjuntos de datos por temática.
-11. Integración de fuentes cuando sea técnicamente válida.
-12. Agregaciones necesarias para responder las preguntas del proyecto.
-
-Decisiones de limpieza documentadas:
-- NO se reemplazan valores nulos por cero. Un nulo no significa ausencia de contagios.
-- NO se eliminan registros indiscriminadamente; se evalúa cada caso.
-- NO se convierten conteos acumulados en diarios sin verificar el significado.
-- NO se confunden conteos, tasas y porcentajes.
-"""
-
 import logging
 from pathlib import Path
 from typing import Optional
@@ -37,6 +11,7 @@ from pyspark.sql.types import (
     DateType,
     StringType,
 )
+from pyspark.sql.window import Window
 
 from etl.spark_config import get_spark_session
 from etl.extraccion import RAW_GOOGLE_DIR
@@ -123,19 +98,7 @@ HOSPITALIZATIONS_COLS = {
 # ---------------------------------------------------------------------------
 
 def leer_csv_crudo(spark, nombre_archivo: str) -> Optional[DataFrame]:
-    """
-    Lee un archivo CSV crudo desde data/raw/google/.
-
-    Parámetros
-    ----------
-    spark : SparkSession
-    nombre_archivo : str
-        Nombre del archivo (ej: "epidemiology.csv").
-
-    Retorna
-    -------
-    DataFrame o None
-    """
+  
     ruta = RAW_GOOGLE_DIR / nombre_archivo
     if not ruta.exists():
         logger.error("Archivo no encontrado: %s", ruta)
@@ -153,19 +116,7 @@ def leer_csv_crudo(spark, nombre_archivo: str) -> Optional[DataFrame]:
 
 
 def convertir_tipos(df: DataFrame, columnas_tipo: dict) -> DataFrame:
-    """
-    Convierte las columnas especificadas a los tipos indicados.
-
-    Parámetros
-    ----------
-    df : DataFrame
-    columnas_tipo : dict
-        {nombre_columna: "long" | "double" | "int" | "string" | "date"}
-
-    Retorna
-    -------
-    DataFrame con las columnas convertidas.
-    """
+    
     tipo_map = {
         "long": LongType(),
         "int": IntegerType(),
@@ -181,49 +132,66 @@ def convertir_tipos(df: DataFrame, columnas_tipo: dict) -> DataFrame:
             # Convertir string a fecha
             df = df.withColumn(col_name, F.to_date(F.col(col_name), "yyyy-MM-dd"))
         elif tipo_str in tipo_map:
+            # 1. Guardar la columna original (string) ANTES del cast.
+            orig_col = f"_orig_{col_name}"
+            df = df.withColumn(orig_col, F.col(col_name))
+
+            # 2. Castear al tipo destino.
             df = df.withColumn(col_name, F.col(col_name).cast(tipo_map[tipo_str]))
+
+            flag_col = f"_cast_failed_{col_name}"
+            df = df.withColumn(
+                flag_col,
+                F.col(orig_col).isNotNull() & F.col(col_name).isNull()
+            )
+
+            logger.info(
+                "Cast de '%s' a %s programado. Flag '%s' añadida para detectar "
+                "filas no convertibles (se evalúa lazily, sin count() extra).",
+                col_name, tipo_str, flag_col,
+            )
+
+            # 4. Eliminar la columna temporal original.
+            df = df.drop(orig_col)
 
     return df
 
 
-def eliminar_duplicados(df: DataFrame, subset: list = None) -> DataFrame:
-    """
-    Elimina filas duplicadas, conservando la primera ocurrencia.
+def eliminar_duplicados(df: DataFrame, subset: list = None,
+                       orden_por: str = None,
+                       contar_eliminados: bool = False) -> DataFrame:
+    
+    if contar_eliminados:
+        total_antes = df.count()
 
-    Parámetros
-    ----------
-    df : DataFrame
-    subset : list, opcional
-        Columnas a considerar para identificar duplicados.
-        Si None, usa todas las columnas.
-
-    Retorna
-    -------
-    DataFrame sin duplicados.
-    """
-    total_antes = df.count()
-    df_limpio = df.dropDuplicates(subset)
-    total_despues = df_limpio.count()
-    eliminados = total_antes - total_despues
-    if eliminados > 0:
-        logger.info("Duplicados eliminados: %d (de %d a %d)", eliminados, total_antes, total_despues)
+    if subset is None:
+        df_limpio = df.dropDuplicates()
+    elif orden_por is not None and orden_por in df.columns:
+        # Usar ventana para conservar la fila con el valor más alto en orden_por
+        w = Window.partitionBy(*subset).orderBy(F.desc_nulls_last(F.col(orden_por)))
+        df_limpio = (
+            df.withColumn("_row_num", F.row_number().over(w))
+            .filter(F.col("_row_num") == 1)
+            .drop("_row_num")
+        )
     else:
-        logger.info("No se encontraron duplicados.")
+        df_limpio = df.dropDuplicates(subset)
+
+    if contar_eliminados:
+        total_despues = df_limpio.count()
+        eliminados = total_antes - total_despues
+        if eliminados > 0:
+            logger.info("Duplicados eliminados: %d (de %d a %d)", eliminados, total_antes, total_despues)
+        else:
+            logger.info("No se encontraron duplicados.")
+    else:
+        logger.info("Deduplicación completada (contar_eliminados=False — sin count() adicionales).")
+
     return df_limpio
 
 
 def validar_no_negativos(df: DataFrame, columnas_numericas: list) -> DataFrame:
-    """
-    Marca registros con valores negativos en columnas donde no deberían existir.
-
-    En lugar de eliminar los registros, se conservan y se registran en logs
-    para análisis posterior. Los valores negativos en conteos acumulados pueden
-    deberse a correcciones o reinicios.
-
-    Retorna
-    -------
-    DataFrame con los mismos registros (no se eliminan).
-    """
+  
     for col_name in columnas_numericas:
         if col_name not in df.columns:
             continue
@@ -238,22 +206,7 @@ def validar_no_negativos(df: DataFrame, columnas_numericas: list) -> DataFrame:
 
 
 def filtrar_colombia(df: DataFrame, col_location: str = "location_key") -> DataFrame:
-    """
-    Filtra el DataFrame para conservar únicamente registros de Colombia.
-
-    En Google Cloud Platform, Colombia se identifica con location_key
-    que empieza con "CO" (ISO 3166-1 alpha-2).
-
-    Parámetros
-    ----------
-    df : DataFrame
-    col_location : str
-        Nombre de la columna de ubicación.
-
-    Retorna
-    -------
-    DataFrame con solo registros de Colombia.
-    """
+    
     if col_location not in df.columns:
         logger.warning("Columna '%s' no encontrada. No se puede filtrar por Colombia.", col_location)
         return df
@@ -264,25 +217,55 @@ def filtrar_colombia(df: DataFrame, col_location: str = "location_key") -> DataF
     return df_col
 
 
-# ---------------------------------------------------------------------------
-# Transformaciones por archivo
-# ---------------------------------------------------------------------------
+def filtrar_nivel_geografico(df: DataFrame, nivel: str = "pais",
+                             col_location: str = "location_key") -> DataFrame:
+    
+    if col_location not in df.columns:
+        logger.warning("Columna '%s' no encontrada. No se puede filtrar por nivel.", col_location)
+        return df
+
+    num_guiones = F.size(F.split(F.col(col_location), "_")) - 1
+
+    if nivel == "pais":
+        df_filtrado = df.filter(num_guiones == 0)
+    elif nivel == "subregion":
+        df_filtrado = df.filter(num_guiones == 1)
+    elif nivel == "municipio":
+        df_filtrado = df.filter(num_guiones == 2)
+    else:
+        logger.warning("Nivel '%s' no reconocido. Opciones: pais, subregion, municipio.", nivel)
+        return df
+
+    total = df_filtrado.count()
+    logger.info("Filtrado a nivel '%s': %d registros.", nivel, total)
+    return df_filtrado
+
+_AGE_BUCKET_NORMALIZACION = {
+    "80-":    "80+",
+    "80-89":  "80+",
+    "80-99":  "80+",
+    "90+":    "80+",
+    "90-":    "80+",
+    "90-99":  "80+",
+    "100+":   "80+",
+}
+
+def _expr_normalizar_age_bucket(col_name: str = "age_bucket"):
+
+    expr = None
+    for variante, canonica in _AGE_BUCKET_NORMALIZACION.items():
+        condicion = F.col(col_name) == F.lit(variante)
+        if expr is None:
+            expr = F.when(condicion, F.lit(canonica))
+        else:
+            expr = expr.when(condicion, F.lit(canonica))
+    # Para cualquier etiqueta no listada en el mapa, conservar el valor original
+    return expr.otherwise(F.col(col_name)) if expr is not None else F.col(col_name)
+
+
 
 def transformar_epidemiologia(spark) -> Optional[DataFrame]:
-    """
-    Transforma el archivo epidemiology.csv.
-
-    Pasos:
-    1. Leer CSV crudo.
-    2. Convertir tipos (date, columnas numéricas).
-    3. Eliminar duplicados.
-    4. Validar valores negativos.
-    5. Integrar con index.csv para obtener nombres de país/región.
-
-    Retorna
-    -------
-    DataFrame transformado o None si el archivo no existe.
-    """
+   
     logger.info("=" * 60)
     logger.info("TRANSFORMANDO: epidemiology.csv")
     logger.info("=" * 60)
@@ -296,9 +279,22 @@ def transformar_epidemiologia(spark) -> Optional[DataFrame]:
     tipos.update(EPIDEMIOLOGY_COLS)
     df = convertir_tipos(df, tipos)
 
+    if "date" in df.columns:
+        df = df.filter(
+            F.col("date").isNull() | (F.col("date") >= F.lit("2019-12-01").cast("date"))
+        )
+
     # Eliminar duplicados (misma fecha + misma ubicación)
     if "location_key" in df.columns and "date" in df.columns:
         df = eliminar_duplicados(df, subset=["date", "location_key"])
+
+    if "location_key" in df.columns:
+        antes = df
+        df = df.filter(
+            F.col("location_key").isNotNull() &
+            (F.length(F.trim(F.col("location_key"))) > 0)
+        )
+        logger.info("Registros sin location_key eliminados (nulos o vacíos).")
 
     # Validar valores negativos en columnas de conteo
     validar_no_negativos(df, list(EPIDEMIOLOGY_COLS.keys()))
@@ -308,26 +304,7 @@ def transformar_epidemiologia(spark) -> Optional[DataFrame]:
 
 
 def transformar_by_age(spark) -> Optional[DataFrame]:
-    """
-    Transforma el archivo by-age.csv.
-
-    El archivo original está en formato WIDE: cada grupo etario es una columna
-    (new_confirmed_age_0, new_confirmed_age_1, ..., age_bin_0, age_bin_1, ...).
-    Hay 10 grupos etarios (age_0 a age_9).
-
-    Esta función convierte el formato WIDE a LONG usando la función `stack`
-    de Spark SQL, que hace el unpivot en una sola pasada (mucho más eficiente
-    que múltiples uniones).
-
-    Produce un DataFrame con columnas:
-    date, location_key, age_bucket, new_confirmed, new_deceased.
-
-    Los age_bin_X contienen las etiquetas reales: "0-9", "10-19", ..., "90-".
-
-    Retorna
-    -------
-    DataFrame transformado en formato LONG o None.
-    """
+ 
     logger.info("=" * 60)
     logger.info("TRANSFORMANDO: by-age.csv (WIDE -> LONG con stack)")
     logger.info("=" * 60)
@@ -344,6 +321,8 @@ def transformar_by_age(spark) -> Optional[DataFrame]:
         cols_needed.append(f"age_bin_{i}")
         cols_needed.append(f"new_confirmed_age_{i}")
         cols_needed.append(f"new_deceased_age_{i}")
+        cols_needed.append(f"cumulative_confirmed_age_{i}")
+        cols_needed.append(f"cumulative_deceased_age_{i}")
 
     # Leer el CSV y seleccionar solo las columnas que existen
     df_all = (
@@ -360,23 +339,27 @@ def transformar_by_age(spark) -> Optional[DataFrame]:
     # Convertir date a tipo fecha
     df = df.withColumn("date", F.to_date(F.col("date"), "yyyy-MM-dd"))
 
-    # Construir la expresión stack para unpivot en una sola pasada
-    # stack(n, col1_1, col1_2, col1_3, col2_1, col2_2, col2_3, ...)
-    # produce n filas con 3 columnas cada una
+    
+    NULL_STR = F.lit(None).cast("string")
+    for i in range(10):
+        for col_opcional in [f"new_deceased_age_{i}",
+                             f"cumulative_confirmed_age_{i}",
+                             f"cumulative_deceased_age_{i}"]:
+            if col_opcional not in df.columns:
+                df = df.withColumn(col_opcional, NULL_STR)
+                logger.debug("Columna '%s' ausente en by-age.csv — añadida como NULL.", col_opcional)
+
     stack_args = []
     for i in range(10):
         age_bin = f"age_bin_{i}"
         new_conf = f"new_confirmed_age_{i}"
         new_dec = f"new_deceased_age_{i}"
+        cum_conf = f"cumulative_confirmed_age_{i}"
+        cum_dec = f"cumulative_deceased_age_{i}"
         if age_bin in df.columns and new_conf in df.columns:
-            stack_args.append(age_bin)
-            stack_args.append(new_conf)
-            if new_dec in df.columns:
-                stack_args.append(new_dec)
-            else:
-                stack_args.append(f"NULL as {new_dec}")
+            stack_args.extend([age_bin, new_conf, new_dec, cum_conf, cum_dec])
 
-    num_cols_per_group = 3  # age_bucket, new_confirmed, new_deceased
+    num_cols_per_group = 5  # age_bucket, new_confirmed, new_deceased, cumulative_confirmed, cumulative_deceased
     num_groups = len(stack_args) // num_cols_per_group
 
     # Crear vista temporal y usar SQL stack
@@ -387,7 +370,7 @@ def transformar_by_age(spark) -> Optional[DataFrame]:
         SELECT 
             date, 
             location_key, 
-            stack({num_groups}, {stack_expr}) AS (age_bucket, new_confirmed, new_deceased)
+            stack({num_groups}, {stack_expr}) AS (age_bucket, new_confirmed, new_deceased, cumulative_confirmed, cumulative_deceased)
         FROM by_age_raw
     """
 
@@ -396,27 +379,33 @@ def transformar_by_age(spark) -> Optional[DataFrame]:
     # Filtrar filas donde age_bucket es nulo
     df_long = df_long.filter(F.col("age_bucket").isNotNull())
 
+    df_long = df_long.withColumn("age_bucket", _expr_normalizar_age_bucket("age_bucket"))
+    logger.info("Etiquetas de age_bucket normalizadas (variantes '80-x' → '80+').")
+
+    # Convertir columnas numéricas de string a long
+    # (el CSV se leyó con inferSchema=False, así que todas son strings)
+    df_long = df_long.withColumn("new_confirmed", F.col("new_confirmed").cast("long"))
+    df_long = df_long.withColumn("new_deceased", F.col("new_deceased").cast("long"))
+    df_long = df_long.withColumn("cumulative_confirmed", F.col("cumulative_confirmed").cast("long"))
+    df_long = df_long.withColumn("cumulative_deceased", F.col("cumulative_deceased").cast("long"))
+
+    df_long = df_long.filter(
+        F.col("date").isNull() | (F.col("date") >= F.lit("2019-12-01").cast("date"))
+    )
+
     # Eliminar duplicados (fecha + ubicación + grupo etario)
     df_long = eliminar_duplicados(df_long, subset=["date", "location_key", "age_bucket"])
 
     # Validar negativos
-    validar_no_negativos(df_long, ["new_confirmed", "new_deceased"])
+    validar_no_negativos(df_long, ["new_confirmed", "new_deceased",
+                                   "cumulative_confirmed", "cumulative_deceased"])
 
     logger.info("Transformacion de by-age completada (WIDE -> LONG con stack): %d filas.", df_long.count())
     return df_long
 
 
 def transformar_demographics(spark) -> Optional[DataFrame]:
-    """
-    Transforma el archivo demographics.csv.
-
-    Contiene datos demográficos por ubicación (no tiene columna date).
-    Proporciona denominadores poblacionales para calcular tasas.
-
-    Retorna
-    -------
-    DataFrame transformado o None.
-    """
+   
     logger.info("=" * 60)
     logger.info("TRANSFORMANDO: demographics.csv")
     logger.info("=" * 60)
@@ -438,15 +427,7 @@ def transformar_demographics(spark) -> Optional[DataFrame]:
 
 
 def transformar_index(spark) -> Optional[DataFrame]:
-    """
-    Transforma el archivo index.csv (índice geográfico).
-
-    Proporciona los nombres de países y regiones asociados a cada location_key.
-
-    Retorna
-    -------
-    DataFrame transformado o None.
-    """
+   
     logger.info("=" * 60)
     logger.info("TRANSFORMANDO: index.csv")
     logger.info("=" * 60)
@@ -464,13 +445,7 @@ def transformar_index(spark) -> Optional[DataFrame]:
 
 
 def transformar_weather(spark) -> Optional[DataFrame]:
-    """
-    Transforma el archivo weather.csv (variables climáticas).
-
-    Retorna
-    -------
-    DataFrame transformado o None.
-    """
+   
     logger.info("=" * 60)
     logger.info("TRANSFORMANDO: weather.csv")
     logger.info("=" * 60)
@@ -483,6 +458,12 @@ def transformar_weather(spark) -> Optional[DataFrame]:
     tipos.update(WEATHER_COLS)
     df = convertir_tipos(df, tipos)
 
+    # Eliminar fechas anteriores al inicio de la pandemia.
+    if "date" in df.columns:
+        df = df.filter(
+            F.col("date").isNull() | (F.col("date") >= F.lit("2019-12-01").cast("date"))
+        )
+
     # Eliminar duplicados
     subset = [c for c in ["date", "location_key"] if c in df.columns]
     if subset:
@@ -493,13 +474,7 @@ def transformar_weather(spark) -> Optional[DataFrame]:
 
 
 def transformar_hospitalizations(spark) -> Optional[DataFrame]:
-    """
-    Transforma el archivo hospitalizations.csv.
-
-    Retorna
-    -------
-    DataFrame transformado o None.
-    """
+    
     logger.info("=" * 60)
     logger.info("TRANSFORMANDO: hospitalizations.csv")
     logger.info("=" * 60)
@@ -511,6 +486,13 @@ def transformar_hospitalizations(spark) -> Optional[DataFrame]:
     tipos = {"date": "date", "location_key": "string"}
     tipos.update(HOSPITALIZATIONS_COLS)
     df = convertir_tipos(df, tipos)
+
+    # Filtrar fechas absurdas (año < 2019) producidas por parsing incorrecto en la fuente.
+    # También se eliminan fechas anteriores a 2019-12-01 (inicio de la pandemia).
+    if "date" in df.columns:
+        df = df.filter(
+            F.col("date").isNull() | (F.col("date") >= F.lit("2019-12-01").cast("date"))
+        )
 
     # Eliminar duplicados
     subset = [c for c in ["date", "location_key"] if c in df.columns]
@@ -524,25 +506,8 @@ def transformar_hospitalizations(spark) -> Optional[DataFrame]:
     return df
 
 
-# ---------------------------------------------------------------------------
-# Integración de fuentes
-# ---------------------------------------------------------------------------
-
 def integrar_con_index(df: DataFrame, df_index: DataFrame) -> DataFrame:
-    """
-    Integra un DataFrame con el índice geográfico para añadir nombres de país/región.
-
-    Parámetros
-    ----------
-    df : DataFrame
-        DataFrame con columna location_key.
-    df_index : DataFrame
-        DataFrame del index.csv con nombres geográficos.
-
-    Retorna
-    -------
-    DataFrame con columnas adicionales: country_name, subregion1_name.
-    """
+   
     if "location_key" not in df.columns or "location_key" not in df_index.columns:
         logger.warning("No se puede integrar: falta la columna location_key.")
         return df
@@ -562,13 +527,7 @@ def integrar_con_index(df: DataFrame, df_index: DataFrame) -> DataFrame:
 
 
 def integrar_con_demographics(df: DataFrame, df_demographics: DataFrame) -> DataFrame:
-    """
-    Integra con demographics para añadir población (denominador para tasas).
-
-    Retorna
-    -------
-    DataFrame con columna population añadida.
-    """
+    
     if "location_key" not in df.columns or "location_key" not in df_demographics.columns:
         logger.warning("No se puede integrar con demographics: falta location_key.")
         return df
@@ -588,30 +547,26 @@ def integrar_con_demographics(df: DataFrame, df_demographics: DataFrame) -> Data
     return df_integrado
 
 
-# ---------------------------------------------------------------------------
-# Agregaciones para responder las preguntas del proyecto
-# ---------------------------------------------------------------------------
-
 def calcular_promedio_casos_por_pais(df_epidemiologia: DataFrame) -> DataFrame:
-    """
-    Pregunta 1: ¿Cuál es el promedio de casos nuevos de COVID-19 por país o región?
-
-    Calcula el promedio de new_confirmed agrupado por country_name.
-
-    Retorna
-    -------
-    DataFrame con columnas: country_name, avg_new_confirmed, total_new_confirmed, dias_con_datos.
-    """
+   
     logger.info("Calculando promedio de casos nuevos por país...")
 
+    # Filtrar a nivel país para evitar doble conteo
+    df_pais = filtrar_nivel_geografico(df_epidemiologia, nivel="pais")
+
+    
     agg = (
-        df_epidemiologia
-        .filter(F.col("new_confirmed").isNotNull())
+        df_pais
+        .filter(
+            F.col("new_confirmed").isNotNull() &
+            (F.col("new_confirmed") > 0) &
+            F.col("country_name").isNotNull()
+        )
         .groupBy("country_name")
         .agg(
             F.avg("new_confirmed").alias("avg_new_confirmed"),
             F.sum("new_confirmed").alias("total_new_confirmed"),
-            F.count("new_confirmed").alias("dias_con_datos"),
+            F.count("new_confirmed").alias("dias_con_contagio"),
             F.max("new_confirmed").alias("max_new_confirmed"),
             F.min("new_confirmed").alias("min_new_confirmed"),
         )
@@ -622,31 +577,31 @@ def calcular_promedio_casos_por_pais(df_epidemiologia: DataFrame) -> DataFrame:
 
 
 def calcular_distribucion_por_edad(df_by_age: DataFrame) -> DataFrame:
-    """
-    Pregunta 2: ¿Cómo se distribuyen los contagios según los diferentes grupos etarios?
-
-    Agrega casos por grupo etario.
-
-    Retorna
-    -------
-    DataFrame con columnas: age_bucket, total_new_confirmed, total_cumulative_confirmed,
-                            total_new_deceased, total_cumulative_deceased.
-    """
+   
     logger.info("Calculando distribución de contagios por grupo etario...")
 
+    # Filtrar a nivel país para evitar doble conteo
+    df_pais = filtrar_nivel_geografico(df_by_age, nivel="pais")
+
     agg_cols = []
-    if "new_confirmed" in df_by_age.columns:
+    if "new_confirmed" in df_pais.columns:
         agg_cols.append(F.sum("new_confirmed").alias("total_new_confirmed"))
-    if "new_deceased" in df_by_age.columns:
+    if "new_deceased" in df_pais.columns:
         agg_cols.append(F.sum("new_deceased").alias("total_new_deceased"))
 
-    if "age_bucket" not in df_by_age.columns:
+    if "age_bucket" not in df_pais.columns:
         logger.warning("Columna 'age_bucket' no encontrada en by-age.")
-        return df_by_age
+        return df_pais
+
+    filtros = F.col("age_bucket").isNotNull()
+    if "new_confirmed" in df_pais.columns:
+        filtros = filtros & (F.col("new_confirmed").isNull() | (F.col("new_confirmed") >= 0))
+    if "new_deceased" in df_pais.columns:
+        filtros = filtros & (F.col("new_deceased").isNull() | (F.col("new_deceased") >= 0))
 
     agg = (
-        df_by_age
-        .filter(F.col("age_bucket").isNotNull())
+        df_pais
+        .filter(filtros)
         .groupBy("age_bucket")
         .agg(*agg_cols)
         .orderBy("age_bucket")
@@ -656,29 +611,45 @@ def calcular_distribucion_por_edad(df_by_age: DataFrame) -> DataFrame:
 
 
 def calcular_evolucion_temporal(df_epidemiologia: DataFrame) -> DataFrame:
-    """
-    Pregunta 4: ¿Cómo ha evolucionado la cantidad de contagios a lo largo del tiempo?
-
-    Agrega casos nuevos por fecha a nivel global.
-
-    Retorna
-    -------
-    DataFrame con columnas: date, total_new_confirmed, total_new_deceased,
-                            total_cumulative_confirmed.
-    """
+   
     logger.info("Calculando evolución temporal de contagios...")
 
+    # Filtrar a nivel país para evitar doble conteo
+    df_pais = filtrar_nivel_geografico(df_epidemiologia, nivel="pais")
+
+    # Excluir negativos antes de agregar.
+    filtros = F.col("date").isNotNull()
+    if "new_confirmed" in df_pais.columns:
+        filtros = filtros & (F.col("new_confirmed").isNull() | (F.col("new_confirmed") >= 0))
+    if "new_deceased" in df_pais.columns:
+        filtros = filtros & (F.col("new_deceased").isNull() | (F.col("new_deceased") >= 0))
+
+    df_filtrado = df_pais.filter(filtros)
+
     agg_cols = []
-    if "new_confirmed" in df_epidemiologia.columns:
+    if "new_confirmed" in df_pais.columns:
         agg_cols.append(F.sum("new_confirmed").alias("total_new_confirmed"))
-    if "new_deceased" in df_epidemiologia.columns:
+    if "new_deceased" in df_pais.columns:
         agg_cols.append(F.sum("new_deceased").alias("total_new_deceased"))
-    if "cumulative_confirmed" in df_epidemiologia.columns:
-        agg_cols.append(F.max("cumulative_confirmed").alias("max_cumulative_confirmed"))
+
+    if "cumulative_confirmed" in df_pais.columns and "location_key" in df_pais.columns:
+        
+        agg_cols.append(
+            F.sum(
+                F.when(
+                    F.col("cumulative_confirmed").isNotNull() &
+                    (F.col("cumulative_confirmed") >= 0),
+                    F.col("cumulative_confirmed")
+                )
+            ).alias("total_cumulative_confirmed")
+        )
+        logger.info(
+            "total_cumulative_confirmed = suma del acumulado de cada país en cada fecha "
+            "(correcto porque hay 1 fila por país gracias a filtrar_nivel_geografico)."
+        )
 
     agg = (
-        df_epidemiologia
-        .filter(F.col("date").isNotNull())
+        df_filtrado
         .groupBy("date")
         .agg(*agg_cols)
         .orderBy("date")
@@ -689,48 +660,75 @@ def calcular_evolucion_temporal(df_epidemiologia: DataFrame) -> DataFrame:
 
 def calcular_tasa_contagio_por_pais(df_epidemiologia: DataFrame,
                                     df_demographics: DataFrame) -> DataFrame:
-    """
-    Pregunta 5: ¿Cuál es la tasa de contagio por país o región?
-
-    La tasa de contagio se calcula como:
-        (total de casos confirmados / población) * 100000 (tasa por 100 mil habitantes)
-
-    Requiere la integración con demographics para obtener la población.
-
-    Retorna
-    -------
-    DataFrame con columnas: country_name, total_confirmed, population,
-                            tasa_por_100k_habitantes.
-    """
+    
     logger.info("Calculando tasa de contagio por país...")
 
-    # Agregar casos totales por país
-    agg_cols = []
-    if "cumulative_confirmed" in df_epidemiologia.columns:
-        agg_cols.append(F.max("cumulative_confirmed").alias("total_confirmed"))
-    if "new_confirmed" in df_epidemiologia.columns:
-        agg_cols.append(F.sum("new_confirmed").alias("suma_new_confirmed"))
+    # Filtrar a nivel país para evitar doble conteo
+    df_pais = filtrar_nivel_geografico(df_epidemiologia, nivel="pais")
 
-    if "country_name" not in df_epidemiologia.columns:
+   
+    agg_cols = []
+    if "new_confirmed" in df_pais.columns:
+        agg_cols.append(
+            F.sum(
+                F.when(F.col("new_confirmed") >= 0, F.col("new_confirmed"))
+            ).alias("total_confirmed")
+        )
+    if "cumulative_confirmed" in df_pais.columns:
+        # Se conserva el acumulado máximo como referencia informativa,
+        # pero NO se usa para calcular la tasa.
+        agg_cols.append(F.max("cumulative_confirmed").alias("max_cumulative_confirmed"))
+
+    if "country_name" not in df_pais.columns:
         logger.warning("Falta country_name en epidemiologia. No se puede calcular tasa por país.")
-        return df_epidemiologia
+        return df_pais
+
+    group_cols = ["location_key", "country_name"]
+    if "country_code" in df_pais.columns:
+        group_cols.append("country_code")
 
     df_agg = (
-        df_epidemiologia
-        .filter(F.col("country_name").isNotNull())
-        .groupBy("country_name")
+        df_pais
+        .filter(
+            F.col("country_name").isNotNull() &
+            F.col("location_key").isNotNull()
+        )
+        .groupBy(*group_cols)
         .agg(*agg_cols)
     )
 
-    # Integrar con demographics para obtener población por país
-    # Demographics tiene una fila por location_key; para país, location_key = country_code
     if "population" in df_demographics.columns and "location_key" in df_demographics.columns:
-        df_pop = df_demographics.select("location_key", "population").distinct()
-        df_agg = df_agg.join(
-            df_pop,
-            df_agg["country_name"] == df_pop["location_key"],
-            how="left"
-        ).drop(df_pop["location_key"])
+        df_pop = (
+            filtrar_nivel_geografico(df_demographics, nivel="pais")
+            .select("location_key", "population")
+            .filter(F.col("population").isNotNull() & (F.col("population") > 0))
+            .distinct()
+        )
+
+        if "location_key" in df_agg.columns:
+            # Join directo por location_key — el más exacto
+            df_agg = df_agg.join(df_pop, on="location_key", how="left")
+            logger.info("Join con demographics realizado por location_key.")
+        elif "country_code" in df_agg.columns:
+            # Fallback: usar country_code como proxy de location_key de nivel país
+            nulos_cc = df_agg.filter(F.col("country_code").isNull()).count()
+            if nulos_cc > 0:
+                logger.warning(
+                    "country_code tiene %d nulos en df_agg. "
+                    "Los países sin country_code quedarán sin población y sin tasa.",
+                    nulos_cc,
+                )
+            df_agg = df_agg.join(
+                df_pop,
+                df_agg["country_code"] == df_pop["location_key"],
+                how="left"
+            ).drop(df_pop["location_key"])
+            logger.info("Join con demographics realizado por country_code (fallback).")
+        else:
+            logger.warning(
+                "Ni location_key ni country_code disponibles en df_agg. "
+                "No se puede unir con demographics; tasa no calculable."
+            )
 
     # Calcular tasa por 100 mil habitantes
     if "total_confirmed" in df_agg.columns and "population" in df_agg.columns:
@@ -746,13 +744,7 @@ def calcular_tasa_contagio_por_pais(df_epidemiologia: DataFrame,
 
 
 def calcular_top_10_paises_tasa(df_tasa: DataFrame) -> DataFrame:
-    """
-    Pregunta 7: ¿Cuáles son los diez países o regiones con las tasas de contagio más altas?
-
-    Retorna
-    -------
-    DataFrame con los 10 países con mayor tasa de contagio.
-    """
+    
     logger.info("Calculando top 10 países por tasa de contagio...")
 
     if "tasa_por_100k_habitantes" not in df_tasa.columns:
@@ -770,91 +762,149 @@ def calcular_top_10_paises_tasa(df_tasa: DataFrame) -> DataFrame:
 
 
 def calcular_relacion_casos_fallecimientos(df_epidemiologia: DataFrame) -> DataFrame:
-    """
-    Pregunta 9: ¿Qué relación existe entre los casos nuevos y los fallecimientos?
-
-    Calcula la tasa de letalidad: (fallecimientos / casos confirmados) * 100
-
-    Retorna
-    -------
-    DataFrame con columnas: country_name, total_new_confirmed, total_new_deceased,
-                            tasa_letalidad_pct.
-    """
+    
     logger.info("Calculando relación entre casos nuevos y fallecimientos...")
 
-    agg_cols = []
-    if "new_confirmed" in df_epidemiologia.columns:
-        agg_cols.append(F.sum("new_confirmed").alias("total_new_confirmed"))
-    if "new_deceased" in df_epidemiologia.columns:
-        agg_cols.append(F.sum("new_deceased").alias("total_new_deceased"))
+    # Filtrar a nivel país para evitar doble conteo
+    df_pais = filtrar_nivel_geografico(df_epidemiologia, nivel="pais")
 
-    if "country_name" not in df_epidemiologia.columns:
+    agg_cols = []
+    if "new_confirmed" in df_pais.columns:
+        agg_cols.append(
+            F.sum(F.when(F.col("new_confirmed") > 0, F.col("new_confirmed")))
+            .alias("total_new_confirmed")
+        )
+    if "new_deceased" in df_pais.columns:
+      
+        agg_cols.append(
+            F.sum(F.when(F.col("new_deceased") > 0, F.col("new_deceased")))
+            .alias("total_new_deceased")
+        )
+
+    if "country_name" not in df_pais.columns:
         logger.warning("Falta country_name. No se puede calcular relación por país.")
-        return df_epidemiologia
+        return df_pais
+
+    # Excluir negativos en ambas columnas para que la tasa de letalidad
+    # no se distorsione por correcciones contables.
+    filtros_letal = F.col("country_name").isNotNull()
+    if "new_confirmed" in df_pais.columns:
+        filtros_letal = filtros_letal & (
+            F.col("new_confirmed").isNull() | (F.col("new_confirmed") >= 0)
+        )
+    if "new_deceased" in df_pais.columns:
+        filtros_letal = filtros_letal & (
+            F.col("new_deceased").isNull() | (F.col("new_deceased") >= 0)
+        )
 
     df_agg = (
-        df_epidemiologia
-        .filter(F.col("country_name").isNotNull())
+        df_pais
+        .filter(filtros_letal)
         .groupBy("country_name")
         .agg(*agg_cols)
     )
 
-    # Calcular tasa de letalidad
+    # Calcular tasa de letalidad solo para países con datos de fallecimientos.
+    # Si total_new_deceased es nulo significa que el país nunca reportó fallecimientos;
+    # en ese caso la tasa queda nula (sin dato), no 0%.
     if "total_new_confirmed" in df_agg.columns and "total_new_deceased" in df_agg.columns:
         df_agg = df_agg.withColumn(
             "tasa_letalidad_pct",
-            F.when(F.col("total_new_confirmed") > 0,
-                   (F.col("total_new_deceased") / F.col("total_new_confirmed")) * 100)
-            .otherwise(None)
+            F.when(
+                F.col("total_new_confirmed") > 0,
+                (F.col("total_new_deceased") / F.col("total_new_confirmed")) * 100
+            ).otherwise(None)
         )
-        df_agg = df_agg.orderBy(F.desc("tasa_letalidad_pct"))
+        # Ordenar: países con tasa calculada primero (nulos al final)
+        df_agg = df_agg.orderBy(F.desc_nulls_last("tasa_letalidad_pct"))
 
     return df_agg
 
 
 def calcular_relacion_hospitalizaciones(df_epidemiologia: DataFrame,
                                         df_hospitalizaciones: DataFrame) -> DataFrame:
-    """
-    Pregunta 8: ¿Cómo se comportan las hospitalizaciones y los casos graves
-    en relación con los contagios?
-
-    Integra epidemiología con hospitalizaciones por fecha y ubicación.
-
-    Retorna
-    -------
-    DataFrame con columnas: date, total_new_confirmed, total_new_hospitalized,
-                            total_new_intensive_care, ratio_hospitalizados.
-    """
     logger.info("Calculando relación entre hospitalizaciones y contagios...")
 
-    # Agregar epidemiología por fecha
-    epi_agg = df_epidemiologia
-    if "new_confirmed" in df_epidemiologia.columns:
-        epi_agg = epi_agg.groupBy("date").agg(
-            F.sum("new_confirmed").alias("total_new_confirmed")
-        )
-    else:
-        return df_epidemiologia
+    # Filtrar a nivel país para evitar doble conteo en ambos datasets
+    df_epi_pais = filtrar_nivel_geografico(df_epidemiologia, nivel="pais")
+    df_hosp_pais = filtrar_nivel_geografico(df_hospitalizaciones, nivel="pais")
 
-    # Agregar hospitalizaciones por fecha
-    hosp_agg_cols = []
-    if "new_hospitalized_patients" in df_hospitalizaciones.columns:
-        hosp_agg_cols.append(F.sum("new_hospitalized_patients").alias("total_new_hospitalized"))
-    if "new_intensive_care_patients" in df_hospitalizaciones.columns:
-        hosp_agg_cols.append(F.sum("new_intensive_care_patients").alias("total_new_intensive_care"))
-    if "current_hospitalized_patients" in df_hospitalizaciones.columns:
-        hosp_agg_cols.append(F.sum("current_hospitalized_patients").alias("total_current_hospitalized"))
+    if "new_confirmed" not in df_epi_pais.columns:
+        return df_epi_pais
 
-    if hosp_agg_cols:
-        hosp_agg = df_hospitalizaciones.groupBy("date").agg(*hosp_agg_cols)
-    else:
+    hosp_col_principal = None
+    for c in ["new_hospitalized_patients", "current_hospitalized_patients"]:
+        if c in df_hosp_pais.columns:
+            hosp_col_principal = c
+            break
+
+    if hosp_col_principal is None:
         logger.warning("No se encontraron columnas de hospitalizaciones.")
-        return epi_agg
+        return df_epi_pais
+
+    # Identificar los location_keys que tienen al menos un dato de hospitalización.
+    # El ratio solo tiene sentido sobre este subconjunto de países.
+    location_keys_con_hosp = (
+        df_hosp_pais
+        .filter(F.col(hosp_col_principal).isNotNull() & (F.col(hosp_col_principal) > 0))
+        .select("location_key")
+        .distinct()
+    )
+    n_paises = location_keys_con_hosp.count()
+    logger.info(
+        "Países con datos de hospitalización: %d. "
+        "El ratio se calculará solo sobre estos países.",
+        n_paises,
+    )
+
+    # Restringir epidemiología a los mismos países con datos de hospitalización.
+    # Sin este filtro, el denominador del ratio incluye casos de ~200 países
+    # mientras el numerador solo cubre ~20, produciendo un ratio subestimado.
+    df_epi_restringida = df_epi_pais.join(
+        location_keys_con_hosp, on="location_key", how="inner"
+    )
+
+    # Agregar epidemiología restringida por fecha
+    epi_agg = (
+        df_epi_restringida
+        .filter(
+            F.col("date").isNotNull() &
+            (F.col("new_confirmed").isNull() | (F.col("new_confirmed") >= 0))
+        )
+        .groupBy("date")
+        .agg(
+            F.sum("new_confirmed").alias("total_new_confirmed"),
+            F.countDistinct("location_key").alias("n_paises_con_hospitalizaciones"),
+        )
+    )
+
+    # Agregar hospitalizaciones por fecha (excluyendo negativos)
+    hosp_agg_cols = []
+    if "new_hospitalized_patients" in df_hosp_pais.columns:
+        hosp_agg_cols.append(
+            F.sum(F.when(F.col("new_hospitalized_patients") >= 0,
+                         F.col("new_hospitalized_patients")))
+            .alias("total_new_hospitalized")
+        )
+    if "new_intensive_care_patients" in df_hosp_pais.columns:
+        hosp_agg_cols.append(
+            F.sum(F.when(F.col("new_intensive_care_patients") >= 0,
+                         F.col("new_intensive_care_patients")))
+            .alias("total_new_intensive_care")
+        )
+    if "current_hospitalized_patients" in df_hosp_pais.columns:
+        hosp_agg_cols.append(
+            F.sum(F.when(F.col("current_hospitalized_patients") >= 0,
+                         F.col("current_hospitalized_patients")))
+            .alias("total_current_hospitalized")
+        )
+
+    hosp_agg = df_hosp_pais.groupBy("date").agg(*hosp_agg_cols)
 
     # Unir por fecha
-    df_join = epi_agg.join(hosp_agg, on="date", how="left")
+    df_join = epi_agg.join(hosp_agg, on="date", how="inner")
 
-    # Calcular ratio
+    # Calcular ratio sobre el conjunto comparable de países
     if "total_new_confirmed" in df_join.columns and "total_new_hospitalized" in df_join.columns:
         df_join = df_join.withColumn(
             "ratio_hospitalizados",
@@ -868,32 +918,31 @@ def calcular_relacion_hospitalizaciones(df_epidemiologia: DataFrame,
 
 
 def calcular_distribucion_edad_sexo(df_by_age: DataFrame) -> DataFrame:
-    """
-    Pregunta 10: ¿Cómo se distribuyen los casos según edad y sexo?
-
-    NOTA: El archivo by-age.csv de Google Cloud Platform no contiene
-    desglose por sexo directamente. Solo tiene age_bucket.
-    La variable sexo no está disponible en esta fuente.
-
-    Retorna
-    -------
-    DataFrame con la distribución por edad (sin sexo por limitación de la fuente).
-    """
     logger.info("Calculando distribución por edad (sexo no disponible en la fuente)...")
 
-    if "age_bucket" not in df_by_age.columns:
+    # Filtrar a nivel país para evitar doble conteo
+    df_pais = filtrar_nivel_geografico(df_by_age, nivel="pais")
+
+    if "age_bucket" not in df_pais.columns:
         logger.warning("Columna 'age_bucket' no encontrada.")
-        return df_by_age
+        return df_pais
 
     agg_cols = []
-    if "new_confirmed" in df_by_age.columns:
+    if "new_confirmed" in df_pais.columns:
         agg_cols.append(F.sum("new_confirmed").alias("total_new_confirmed"))
-    if "new_deceased" in df_by_age.columns:
+    if "new_deceased" in df_pais.columns:
         agg_cols.append(F.sum("new_deceased").alias("total_new_deceased"))
 
+  
+    filtros_sexo = F.col("age_bucket").isNotNull()
+    if "new_confirmed" in df_pais.columns:
+        filtros_sexo = filtros_sexo & (F.col("new_confirmed").isNull() | (F.col("new_confirmed") >= 0))
+    if "new_deceased" in df_pais.columns:
+        filtros_sexo = filtros_sexo & (F.col("new_deceased").isNull() | (F.col("new_deceased") >= 0))
+
     agg = (
-        df_by_age
-        .filter(F.col("age_bucket").isNotNull())
+        df_pais
+        .filter(filtros_sexo)
         .groupBy("age_bucket")
         .agg(*agg_cols)
         .orderBy("age_bucket")
@@ -904,37 +953,27 @@ def calcular_distribucion_edad_sexo(df_by_age: DataFrame) -> DataFrame:
 
 def calcular_relacion_clima_contagios(df_epidemiologia: DataFrame,
                                        df_weather: DataFrame) -> DataFrame:
-    """
-    Pregunta 6: ¿Existe una relación estadística entre variables ambientales
-    y los contagios?
-
-    Integra epidemiología con clima por fecha y ubicación.
-    Calcula correlación entre temperatura/humedad y casos nuevos.
-
-    NOTA: Esta función prepara los datos. La correlación estadística
-    se evalúa por separado (no se afirma causalidad).
-
-    Retorna
-    -------
-    DataFrame con columnas: date, location_key, new_confirmed,
-                            average_temperature, relative_humidity, rainfall.
-    """
+   
     logger.info("Preparando datos de relación clima-contagios...")
+
+    # Filtrar a nivel país para evitar mezclar granularidades
+    df_epi_pais = filtrar_nivel_geografico(df_epidemiologia, nivel="pais")
+    df_weather_pais = filtrar_nivel_geografico(df_weather, nivel="pais")
 
     # Filtrar columnas relevantes
     epi_cols = ["date", "location_key"]
-    if "new_confirmed" in df_epidemiologia.columns:
+    if "new_confirmed" in df_epi_pais.columns:
         epi_cols.append("new_confirmed")
 
     weather_cols = ["date", "location_key"]
     for c in ["average_temperature_celsius", "relative_humidity", "rainfall_mm"]:
-        if c in df_weather.columns:
+        if c in df_weather_pais.columns:
             weather_cols.append(c)
 
-    df_epi_sel = df_epidemiologia.select(*[c for c in epi_cols if c in df_epidemiologia.columns])
-    df_weather_sel = df_weather.select(*[c for c in weather_cols if c in df_weather.columns])
+    df_epi_sel = df_epi_pais.select(*[c for c in epi_cols if c in df_epi_pais.columns])
+    df_weather_sel = df_weather_pais.select(*[c for c in weather_cols if c in df_weather_pais.columns])
 
-    df_join = df_epi_sel.join(df_weather_sel, on=["date", "location_key"], how="inner")
+    df_join = df_epi_sel.join(df_weather_sel, on=["date", "location_key"], how="left")
 
     logger.info("Datos clima-contagios preparados: %d filas.", df_join.count())
     return df_join
@@ -945,14 +984,7 @@ def calcular_relacion_clima_contagios(df_epidemiologia: DataFrame,
 # ---------------------------------------------------------------------------
 
 def ejecutar_transformaciones(spark) -> dict:
-    """
-    Ejecuta todas las transformaciones y devuelve los DataFrames resultantes.
-
-    Retorna
-    -------
-    dict
-        Diccionario con todos los DataFrames transformados y las agregaciones.
-    """
+    
     logger.info("=" * 60)
     logger.info("INICIANDO TRANSFORMACIONES CON SPARK")
     logger.info("=" * 60)
