@@ -1,19 +1,3 @@
-"""
-exploracion.py
---------------
-Exploración de los datos descargados utilizando PySpark.
-
-Responsabilidades:
-- Cargar cada archivo CSV con PySpark.
-- Identificar número de registros, columnas, esquema y tipos de datos.
-- Identificar valores nulos, duplicados y valores únicos relevantes.
-- Identificar fechas mínimas y máximas.
-- Identificar países y regiones disponibles.
-- Identificar variables epidemiológicas.
-- Evaluar cobertura de datos por fuente.
-- Identificar problemas de calidad que puedan afectar análisis posteriores.
-"""
-
 import logging
 from pathlib import Path
 from typing import Optional
@@ -30,21 +14,7 @@ RAW_GOOGLE_DIR = PROJECT_ROOT / "data" / "raw" / "google"
 
 
 def cargar_csv(spark, nombre_archivo: str) -> Optional[DataFrame]:
-    """
-    Carga un archivo CSV desde data/raw/google/ como DataFrame de Spark.
-
-    Parámetros
-    ----------
-    spark : SparkSession
-        Sesión Spark activa.
-    nombre_archivo : str
-        Nombre del archivo (ej: "epidemiology.csv").
-
-    Retorna
-    -------
-    DataFrame o None
-        DataFrame cargado, o None si el archivo no existe.
-    """
+  
     ruta = RAW_GOOGLE_DIR / nombre_archivo
     if not ruta.exists():
         logger.warning("Archivo no encontrado: %s", ruta)
@@ -62,14 +32,7 @@ def cargar_csv(spark, nombre_archivo: str) -> Optional[DataFrame]:
 
 
 def explorar_esquema(df: DataFrame, nombre: str) -> dict:
-    """
-    Extrae el esquema del DataFrame y lo registra en logs.
-
-    Retorna
-    -------
-    dict
-        Diccionario con columnas y tipos de datos.
-    """
+   
     logger.info("=" * 60)
     logger.info("ESQUEMA DE: %s", nombre)
     logger.info("=" * 60)
@@ -83,14 +46,7 @@ def explorar_esquema(df: DataFrame, nombre: str) -> dict:
 
 
 def explorar_nulos(df: DataFrame, nombre: str) -> dict:
-    """
-    Cuenta valores nulos por columna.
-
-    Retorna
-    -------
-    dict
-        Diccionario {columna: cantidad_nulos}
-    """
+   
     logger.info("-" * 40)
     logger.info("VALORES NULOS EN: %s", nombre)
 
@@ -107,14 +63,7 @@ def explorar_nulos(df: DataFrame, nombre: str) -> dict:
 
 
 def explorar_duplicados(df: DataFrame, nombre: str) -> int:
-    """
-    Cuenta registros duplicados en el DataFrame.
-
-    Retorna
-    -------
-    int
-        Número de filas duplicadas.
-    """
+    
     total = df.count()
     distintos = df.distinct().count()
     duplicados = total - distintos
@@ -125,22 +74,7 @@ def explorar_duplicados(df: DataFrame, nombre: str) -> int:
 
 
 def explorar_fechas(df: DataFrame, nombre: str, col_fecha: str = "date") -> dict:
-    """
-    Identifica fechas mínimas y máximas en el DataFrame.
-
-    Parámetros
-    ----------
-    df : DataFrame
-    nombre : str
-        Nombre del dataset para logs.
-    col_fecha : str
-        Nombre de la columna de fecha (por defecto "date").
-
-    Retorna
-    -------
-    dict
-        Diccionario con fecha_min, fecha_max, o vacío si la columna no existe.
-    """
+    
     if col_fecha not in df.columns:
         logger.info("La columna '%s' no existe en %s. Columnas: %s",
                      col_fecha, nombre, df.columns)
@@ -162,22 +96,7 @@ def explorar_fechas(df: DataFrame, nombre: str, col_fecha: str = "date") -> dict
 
 def explorar_ubicaciones(df: DataFrame, nombre: str,
                          col_location: str = "location_key") -> dict:
-    """
-    Identifica países y regiones disponibles en el DataFrame.
-
-    Parámetros
-    ----------
-    df : DataFrame
-    nombre : str
-        Nombre del dataset para logs.
-    col_location : str
-        Nombre de la columna que identifica la ubicación.
-
-    Retorna
-    -------
-    dict
-        Diccionario con número de ubicaciones y ejemplos.
-    """
+    
     if col_location not in df.columns:
         logger.info("La columna '%s' no existe en %s.", col_location, nombre)
         return {}
@@ -198,17 +117,7 @@ def explorar_ubicaciones(df: DataFrame, nombre: str,
 
 def explorar_colombia(df: DataFrame, nombre: str,
                       col_location: str = "location_key") -> dict:
-    """
-    Evalúa la cobertura de datos para Colombia.
-
-    En el índice de Google Cloud Platform, Colombia se identifica con
-    location_key que empieza con "CO" (código ISO 3166-1 alpha-2).
-
-    Retorna
-    -------
-    dict
-        Información sobre la cobertura de Colombia.
-    """
+   
     if col_location not in df.columns:
         return {"disponible": False, "motivo": f"Columna '{col_location}' no existe"}
 
@@ -237,20 +146,7 @@ def explorar_colombia(df: DataFrame, nombre: str,
 
 
 def explorar_archivo(spark, nombre_archivo: str) -> dict:
-    """
-    Ejecuta la exploración completa de un archivo.
-
-    Parámetros
-    ----------
-    spark : SparkSession
-    nombre_archivo : str
-        Nombre del CSV a explorar (ej: "epidemiology.csv").
-
-    Retorna
-    -------
-    dict
-        Diccionario con toda la información de exploración.
-    """
+   
     nombre = nombre_archivo.replace(".csv", "")
     df = cargar_csv(spark, nombre_archivo)
 
@@ -278,14 +174,7 @@ def explorar_archivo(spark, nombre_archivo: str) -> dict:
 
 
 def explorar_todas_las_fuentes() -> dict:
-    """
-    Ejecuta la exploración de todos los archivos disponibles en data/raw/google/.
-
-    Retorna
-    -------
-    dict
-        Resultados consolidados de la exploración.
-    """
+    
     spark = get_spark_session("Exploracion_Epidemiologia")
 
     logger.info("=" * 60)
@@ -318,18 +207,3 @@ def explorar_todas_las_fuentes() -> dict:
 
     stop_spark_session()
     return resultados
-
-
-# ---------------------------------------------------------------------------
-# Ejecución directa
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s — %(levelname)s — %(message)s",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(str(PROJECT_ROOT / "logs" / "exploracion.log"), encoding="utf-8"),
-        ],
-    )
-    explorar_todas_las_fuentes()
