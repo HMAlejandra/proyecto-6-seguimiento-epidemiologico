@@ -1,22 +1,3 @@
-"""
-main.py
--------
-Punto de entrada general del Proyecto 6 — Seguimiento Epidemiológico.
-
-Permite ejecutar:
-- El proceso ETL completo (descarga → transformación → calidad → carga → ANOVA).
-- Solo la descarga de datos.
-- Solo la exploración.
-- Solo las pruebas.
-- El análisis estadístico por separado.
-
-Uso:
-    python main.py etl              # Ejecuta el ETL completo
-    python main.py descargar       # Solo descarga los datos
-    python main.py explorar        # Solo explora los datos
-    python main.py anova           # Solo ejecuta el análisis ANOVA
-    python main.py pruebas         # Ejecuta las pruebas con pytest
-"""
 
 import logging
 import sys
@@ -87,53 +68,24 @@ def ejecutar_pruebas():
     sys.exit(result.returncode)
 
 
-def mostrar_ayuda():
-    """Muestra la ayuda de uso."""
-    print("""
-Proyecto 6 — Seguimiento Epidemiológico de Enfermedades Respiratorias
-=====================================================================
-
-Uso:
-    python main.py <comando>
-
-Comandos disponibles:
-    etl         Ejecuta el proceso ETL completo
-                    (descarga → exploración → transformación → calidad → carga → ANOVA)
-    descargar    Solo descarga los datos de Google Cloud Platform
-    explorar     Solo explora la estructura de los datos descargados
-    anova        Solo ejecuta el análisis estadístico ANOVA
-    pruebas      Ejecuta las pruebas automatizadas con pytest
-    ayuda        Muestra esta ayuda
-
-Ejemplos:
-    python main.py etl
-    python main.py descargar
-    python main.py pruebas
-    """)
-
-
-COMANDOS = {
-    "etl": ejecutar_etl,
-    "descargar": ejecutar_descarga,
-    "explorar": ejecutar_exploracion,
-    "anova": ejecutar_anova,
-    "pruebas": ejecutar_pruebas,
-    "ayuda": mostrar_ayuda,
-}
-
-
 if __name__ == "__main__":
     configurar_logging()
 
-    if len(sys.argv) < 2:
-        mostrar_ayuda()
-        sys.exit(0)
-
-    comando = sys.argv[1].lower()
-
-    if comando not in COMANDOS:
-        print(f"Comando desconocido: '{comando}'")
-        mostrar_ayuda()
-        sys.exit(1)
-
-    COMANDOS[comando]()
+    if len(sys.argv) > 1:
+        comando = sys.argv[1]
+        if comando == "etl":
+            ejecutar_etl()
+        elif comando == "descarga":
+            ejecutar_descarga()
+        elif comando == "exploracion":
+            ejecutar_exploracion()
+        elif comando == "anova":
+            ejecutar_anova()
+        elif comando == "tests":
+            ejecutar_pruebas()
+        else:
+            print(f"Comando no reconocido: '{comando}'")
+            print("Opciones disponibles: etl, descarga, exploracion, anova, tests")
+    else:
+        # Sin argumento ejecuta el ETL completo
+        ejecutar_etl()
