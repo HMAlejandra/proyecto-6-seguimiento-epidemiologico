@@ -1,5 +1,8 @@
 # Proyecto 6 — Seguimiento Epidemiológico de COVID-19 en Colombia
 
+Link de Drive de Power Bi: https://drive.google.com/drive/folders/1GQMuJbYARe6oRxxJeuIaMHVOd747pXjX?usp=sharing
+
+
 **ETL con Apache Spark (PySpark) · Modelado y visualización con Power BI · Análisis estadístico con Python**
 
 > Proyecto académico desarrollado para la asignatura **Herramientas Computacionales**, Universidad Cooperativa de Colombia, campus Pasto, 2026.
